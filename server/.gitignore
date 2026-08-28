@@ -1,0 +1,6 @@
+.env
+config.json
+data/
+runtime/
+__pycache__/
+*.pyc

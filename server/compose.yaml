@@ -1,0 +1,21 @@
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8047}:8047"
+    environment:
+      ADMIN_TOKEN: "${ADMIN_TOKEN:?Set ADMIN_TOKEN in server/.env before starting}"
+      RELAY_TOKEN: "${RELAY_TOKEN:-}"
+      HEARTBEAT_TIMEOUT_SECONDS: "${HEARTBEAT_TIMEOUT_SECONDS:-90}"
+      EVENT_RETENTION_SECONDS: "${EVENT_RETENTION_SECONDS:-86400}"
+      MAX_EVENTS_PER_GROUP: "${MAX_EVENTS_PER_GROUP:-1000}"
+      MAX_POLL_SECONDS: "${MAX_POLL_SECONDS:-30}"
+    volumes:
+      - ./runtime/config:/app/config:ro
+      - relay-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  relay-data:

@@ -1,0 +1,53 @@
+{
+  "groups": [
+    {
+      "id": "customer-service",
+      "sharedToken": "replace-with-a-long-random-token"
+    }
+  ],
+  "monitors": [
+    {
+      "id": "main-balance",
+      "groupId": "customer-service",
+      "name": "Main account balance",
+      "url": "https://example.com/api/balance",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer replace-with-api-token"
+      },
+      "jsonPath": "data.credit",
+      "operator": "<",
+      "threshold": 10,
+      "multiplier": 0.0166666667,
+      "offset": 0,
+      "pollIntervalSeconds": 60,
+      "timeoutSeconds": 10,
+      "repeatAlertSeconds": 300,
+      "errorThreshold": 3,
+      "enabled": false
+    },
+    {
+      "id": "backup-quota",
+      "groupId": "customer-service",
+      "name": "Backup quota",
+      "url": "https://example.com/api/quota",
+      "method": "POST",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "account": "backup"
+      },
+      "jsonPath": "accounts[0].remaining",
+      "operator": "<",
+      "threshold": 100,
+      "multiplier": 1,
+      "offset": 0,
+      "pollIntervalSeconds": 60,
+      "timeoutSeconds": 10,
+      "repeatAlertSeconds": 300,
+      "errorThreshold": 3,
+      "enabled": false
+    }
+  ]
+}

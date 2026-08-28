@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">值守报警</string>
+    <string name="monitoring_channel_name">值守报警通信</string>
+    <string name="alert_channel_name">值守紧急报警</string>
+</resources>
