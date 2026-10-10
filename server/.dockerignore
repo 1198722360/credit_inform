@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
 data/
+runtime/
+relay-data/
 tests/
 config.json

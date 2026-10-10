@@ -14,6 +14,10 @@ import com.creditinform.app.data.RemoteMonitorConfig
 import com.creditinform.app.data.RemoteMonitorConfigsResult
 import com.creditinform.app.data.RemoteMonitorDeleteResult
 import com.creditinform.app.data.RemoteMonitorMutationResult
+import com.creditinform.app.data.RemoteMonitorRefreshCheckResult
+import com.creditinform.app.data.RemoteMonitorRefreshError
+import com.creditinform.app.data.RemoteMonitorRefreshItemResult
+import com.creditinform.app.data.RemoteMonitorRefreshResult
 import com.creditinform.app.data.RemoteMonitorStatus
 import com.creditinform.app.data.RemoteMonitorTestResult
 import com.creditinform.app.data.RemoteMonitorUpsertRequest
@@ -48,7 +52,7 @@ class RelayApi {
             config = config,
             method = "GET",
             path = "/api/v1/status",
-            query = mapOf("groupId" to config.groupId),
+            query = emptyMap(),
             auth = Auth.SHARED
         )
         require(json.optString("status") == "ok") { "服务端组状态未返回 ok" }
@@ -90,9 +94,7 @@ class RelayApi {
             method = "POST",
             path = "/api/v1/alerts",
             body = JSONObject().apply {
-                put("groupId", config.groupId)
                 put("senderId", config.deviceId)
-                put("senderName", config.deviceName)
                 put("message", message)
             },
             auth = Auth.SHARED
@@ -109,6 +111,7 @@ class RelayApi {
     fun poll(
         config: RelayConfig,
         after: Long,
+        afterToken: String? = null,
         waitSeconds: Int = DEFAULT_POLL_SECONDS
     ): RelayPollResult {
         val wait = waitSeconds.coerceIn(0, MAX_POLL_SECONDS)
@@ -116,12 +119,12 @@ class RelayApi {
             config = config,
             method = "GET",
             path = "/api/v1/alerts",
-            query = mapOf(
-                "groupId" to config.groupId,
-                "clientId" to config.deviceId,
-                "after" to after.toString(),
-                "wait" to wait.toString()
-            ),
+            query = buildMap {
+                put("clientId", config.deviceId)
+                put("after", after.toString())
+                afterToken?.takeIf { it.isNotBlank() }?.let { put("afterToken", it) }
+                put("wait", wait.toString())
+            },
             auth = Auth.SHARED,
             readTimeoutMs = wait * 1_000 + POLL_TIMEOUT_GRACE_MS
         )
@@ -136,7 +139,9 @@ class RelayApi {
             cursor = json.optLong("cursor", after),
             headCursor = json.optLong("headCursor", json.optLong("cursor", after)),
             serverTime = json.optLong("serverTime"),
-            serverInstanceId = serverInstanceId
+            serverInstanceId = serverInstanceId,
+            cursorToken = json.nullableString("cursorToken"),
+            cursorValid = json.optBoolean("cursorValid", true)
         )
     }
 
@@ -145,7 +150,7 @@ class RelayApi {
             config = config,
             method = "GET",
             path = "/api/v1/monitors",
-            query = mapOf("groupId" to config.groupId),
+            query = emptyMap(),
             auth = Auth.SHARED
         )
         val configJson = json.optJSONObject("config") ?: JSONObject()
@@ -170,22 +175,10 @@ class RelayApi {
             config = config,
             method = "GET",
             path = "/api/v1/admin/monitors",
-            query = mapOf("groupId" to config.groupId),
+            query = emptyMap(),
             auth = Auth.ADMIN
         )
-        val monitors = json.optJSONArray("monitors") ?: JSONArray()
-        return RemoteMonitorConfigsResult(
-            serverTime = json.optLong("serverTime"),
-            keepPlaceholder = json.optString(
-                "keepPlaceholder",
-                RemoteMonitorConfig.KEEP_PLACEHOLDER
-            ),
-            monitors = buildList {
-                for (index in 0 until monitors.length()) {
-                    add(monitors.getJSONObject(index).toRemoteMonitorConfig())
-                }
-            }
-        )
+        return json.toRemoteMonitorConfigsResult()
     }
 
     fun createMonitor(
@@ -196,7 +189,7 @@ class RelayApi {
             config = config,
             method = "POST",
             path = "/api/v1/admin/monitors",
-            body = request.toJson(config.groupId),
+            body = request.toJson(),
             auth = Auth.ADMIN
         )
     )
@@ -210,7 +203,7 @@ class RelayApi {
             config = config,
             method = "PUT",
             path = "/api/v1/admin/monitors/${monitorId.urlEncode()}",
-            body = request.toJson(config.groupId),
+            body = request.toJson(),
             auth = Auth.ADMIN
         )
     )
@@ -220,19 +213,45 @@ class RelayApi {
             config = config,
             method = "DELETE",
             path = "/api/v1/admin/monitors/${monitorId.urlEncode()}",
-            query = mapOf("groupId" to config.groupId),
+            query = emptyMap(),
             auth = Auth.ADMIN
         )
         require(json.optBoolean("ok")) { "服务端未确认删除监控" }
         return RemoteMonitorDeleteResult(serverTime = json.optLong("serverTime"))
     }
 
+    fun copyMonitor(config: RelayConfig, monitorId: String): RemoteMonitorMutationResult =
+        parseMonitorMutation(
+            execute(
+                config = config,
+                method = "POST",
+                path = "/api/v1/admin/monitors/${monitorId.urlEncode()}/copy",
+                body = JSONObject(),
+                auth = Auth.ADMIN
+            )
+        )
+
+    fun reorderMonitors(
+        config: RelayConfig,
+        expectedMonitorIds: List<String>,
+        monitorIds: List<String>
+    ): RemoteMonitorConfigsResult = execute(
+        config = config,
+        method = "POST",
+        path = "/api/v1/admin/monitors/reorder",
+        body = JSONObject().apply {
+            put("expectedMonitorIds", JSONArray(expectedMonitorIds))
+            put("monitorIds", JSONArray(monitorIds))
+        },
+        auth = Auth.ADMIN
+    ).toRemoteMonitorConfigsResult()
+
     fun testMonitor(config: RelayConfig, monitorId: String): RemoteMonitorTestResult {
         val json = execute(
             config = config,
             method = "POST",
             path = "/api/v1/admin/monitors/${monitorId.urlEncode()}/test",
-            body = JSONObject().put("groupId", config.groupId),
+            body = JSONObject(),
             auth = Auth.ADMIN,
             readTimeoutMs = MONITOR_TEST_READ_TIMEOUT_MS
         )
@@ -249,6 +268,57 @@ class RelayApi {
             rawValue = result.nullableDouble("rawValue"),
             value = result.nullableDouble("value"),
             breached = result.optBoolean("breached")
+        )
+    }
+
+    fun refreshMonitors(config: RelayConfig): RemoteMonitorRefreshResult {
+        val json = execute(
+            config = config,
+            method = "POST",
+            path = "/api/v1/admin/monitors/refresh",
+            body = JSONObject(),
+            auth = Auth.ADMIN,
+            readTimeoutMs = MONITOR_REFRESH_READ_TIMEOUT_MS
+        )
+        val resultJson = json.optJSONArray("results") ?: JSONArray()
+        val results = buildList {
+            for (index in 0 until resultJson.length()) {
+                val item = resultJson.getJSONObject(index)
+                val check = item.optJSONObject("result")
+                val error = item.optJSONObject("error")
+                add(
+                    RemoteMonitorRefreshItemResult(
+                        monitorId = item.optString("monitorId"),
+                        monitorName = item.optString("monitorName"),
+                        ok = item.optBoolean("ok"),
+                        result = check?.let {
+                            RemoteMonitorRefreshCheckResult(
+                                httpCode = it.nullableInt("httpCode"),
+                                rawValue = it.nullableDouble("rawValue"),
+                                value = it.nullableDouble("value"),
+                                breached = it.optBoolean("breached")
+                            )
+                        },
+                        error = error?.let {
+                            RemoteMonitorRefreshError(
+                                code = it.optString("code"),
+                                message = it.optString("message"),
+                                httpCode = it.nullableInt("httpCode")
+                            )
+                        }
+                    )
+                )
+            }
+        }
+        val succeeded = json.optInt("succeeded", results.count { it.ok })
+        val total = json.optInt("total", results.size)
+        return RemoteMonitorRefreshResult(
+            ok = json.optBoolean("ok", succeeded == total),
+            serverTime = json.optLong("serverTime"),
+            total = total,
+            succeeded = succeeded,
+            failed = json.optInt("failed", (total - succeeded).coerceAtLeast(0)),
+            results = results
         )
     }
 
@@ -323,7 +393,8 @@ class RelayApi {
             ),
             onlineClients = clients.optInt("online"),
             totalClients = clients.optInt("total"),
-            serverInstanceId = json.nullableString("serverInstanceId")
+            serverInstanceId = json.nullableString("serverInstanceId"),
+            cursorToken = json.nullableString("cursorToken")
         )
     }
 
@@ -340,9 +411,7 @@ class RelayApi {
     }
 
     private fun clientBody(config: RelayConfig) = JSONObject().apply {
-        put("groupId", config.groupId)
         put("clientId", config.deviceId)
-        put("clientName", config.deviceName)
     }
 
     private fun JSONObject.toAlarmEvent(serverInstanceId: String? = null) = RelayAlarmEvent(
@@ -363,6 +432,8 @@ class RelayApi {
         id = getString("id"),
         name = optString("name"),
         enabled = optBoolean("enabled", true),
+        url = optString("url"),
+        method = optString("method", "GET"),
         operator = optString("operator"),
         threshold = optDouble("threshold"),
         pollIntervalSeconds = optLong("pollIntervalSeconds"),
@@ -410,8 +481,23 @@ class RelayApi {
         )
     }
 
-    private fun RemoteMonitorUpsertRequest.toJson(groupId: String) = JSONObject().apply {
-        put("groupId", groupId)
+    private fun JSONObject.toRemoteMonitorConfigsResult(): RemoteMonitorConfigsResult {
+        val monitorJson = optJSONArray("monitors") ?: JSONArray()
+        return RemoteMonitorConfigsResult(
+            serverTime = optLong("serverTime"),
+            keepPlaceholder = optString(
+                "keepPlaceholder",
+                RemoteMonitorConfig.KEEP_PLACEHOLDER
+            ),
+            monitors = buildList {
+                for (index in 0 until monitorJson.length()) {
+                    add(monitorJson.getJSONObject(index).toRemoteMonitorConfig())
+                }
+            }
+        )
+    }
+
+    private fun RemoteMonitorUpsertRequest.toJson() = JSONObject().apply {
         put("name", name)
         put("url", url)
         put("method", method)
@@ -488,6 +574,7 @@ class RelayApi {
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val DEFAULT_READ_TIMEOUT_MS = 15_000
         private const val MONITOR_TEST_READ_TIMEOUT_MS = 45_000
+        private const val MONITOR_REFRESH_READ_TIMEOUT_MS = 120_000
         private const val POLL_TIMEOUT_GRACE_MS = 10_000
         private const val MAX_RESPONSE_CHARS = 1_048_576
         private const val MAX_SERVER_URL_CHARS = 2_048

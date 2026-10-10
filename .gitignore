@@ -5,4 +5,5 @@ local.properties
 **/build/
 *.iml
 captures/
+device-backups/
 .DS_Store

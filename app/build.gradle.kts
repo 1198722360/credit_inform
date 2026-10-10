@@ -1,8 +1,24 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+val localProperties = Properties().apply {
+    val file = rootProject.file("local.properties")
+    if (file.isFile) file.inputStream().use(::load)
+}
+val relayDefaultSharedToken = sequenceOf(
+    localProperties.getProperty("relay.defaultSharedToken"),
+    providers.gradleProperty("relay.defaultSharedToken").orNull,
+    System.getenv("RELAY_DEFAULT_SHARED_TOKEN")
+).firstOrNull { !it.isNullOrBlank() }
+    ?: error("Set relay.defaultSharedToken in local.properties before building the app")
+val relayDefaultSharedTokenLiteral = relayDefaultSharedToken
+    .replace("\\", "\\\\")
+    .replace("\"", "\\\"")
 
 android {
     namespace = "com.creditinform.app"
@@ -13,8 +29,14 @@ android {
         applicationId = "com.creditinform.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 6
+        versionName = "1.3.2"
+
+        buildConfigField(
+            "String",
+            "RELAY_DEFAULT_SHARED_TOKEN",
+            "\"$relayDefaultSharedTokenLiteral\""
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -64,4 +86,5 @@ dependencies {
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

@@ -6,14 +6,15 @@
 
 ## 功能
 
-- 两个或多个客户端使用同一通信组互发人工报警。
-- App 首页显示服务端在线状态、同组在线客户端数量和最近检测时间。
+- 两个或多个客户端连接同一服务端后互发人工报警。
+- App 首页显示服务端在线状态、在线客户端数量和最近检测时间。
 - Android 前台服务使用长轮询接收，支持开机恢复和 watchdog 重启。
 - 报警会唤醒屏幕、循环播放闹钟铃声、强震动，并尝试临时退出静音/勿扰模式。
 - 接收游标和未确认报警持久化；断网或 App 进程重启后继续处理。
+- 客户端与服务端会校验游标令牌；即使服务端从旧备份恢复并复用事件编号，也会重放而不是跳过新报警。
 - 服务端持久化事件，并可集中检测 HTTP 业务端点，将越界或连续错误广播给客户端。
 - 填写管理员密钥后，可直接在 App 中新增、编辑、测试、停用或删除服务端监控项。
-- 请求头、请求体和 URL 查询参数值只写不回显，管理界面只显示固定脱敏占位符。
+- 管理员可查看和编辑完整 URL、请求头与请求体；普通客户端仍只看到脱敏地址。
 - 上游请求异常也不会把原始 URL、请求头或请求体内容回传到手机。
 - 共享密钥与管理员密钥在 Android 端使用 Keystore AES-GCM 加密保存。
 
@@ -34,6 +35,9 @@ python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 cd server
 mkdir -p runtime/config
 cp config.example.json runtime/config/config.json
+mkdir -p relay-data
+sudo chown 10001:10001 relay-data
+sudo chmod 700 relay-data
 ```
 
 编辑 `runtime/config/config.json`，至少修改：
@@ -74,17 +78,24 @@ curl -fsS http://127.0.0.1:8047/health
 在两台手机安装同一个 APK，然后分别打开“连接配置”：
 
 1. 服务端地址：填写相同的 HTTPS 基础地址，例如 `https://alarm.example.com`，不要附加 `/api`。
-2. 通信组：两端都填 `customer-service`。
-3. 共享密钥：两端都填 `config.json` 中的 `sharedToken`。
-4. 客户端名称：分别填写“客服手机”和“我的手机”。
-5. 管理员密钥：仅需要管理服务端监控项的手机填写；客服端可以留空。
-6. 打开“启用通信”，保存并检测。
+2. 共享密钥：两端都填 `config.json` 中的 `sharedToken`。
+3. 管理员密钥：仅需要管理服务端监控项的手机填写；客服端可以留空。
+4. 打开“启用通信”，保存并检测。
+
+当前发布包已预置部署地址和共享密钥，新安装只需打开连接配置并启用通信；客户端 ID
+会在首次启动时随机生成。覆盖升级会保留原有地址、密钥、客户端 ID 和报警设置。
 
 两端首页都显示“服务端在线”后，从客服手机点击“向其他客户端报警”做一次真实测试。发送端不会接收自己发出的报警。
 
 ## 构建 Android App
 
 需要 JDK 17 和 Android SDK 35：
+
+先在未纳入版本控制的 `local.properties` 中配置发布包的默认共享密钥：
+
+```properties
+relay.defaultSharedToken=服务端的共享密钥
+```
 
 ```bash
 ./gradlew testDebugUnitTest assembleDebug

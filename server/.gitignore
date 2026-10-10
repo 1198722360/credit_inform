@@ -2,5 +2,6 @@
 config.json
 data/
 runtime/
+relay-data/
 __pycache__/
 *.pyc

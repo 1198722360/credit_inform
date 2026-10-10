@@ -17,8 +17,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,17 +35,27 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddCircle
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -56,7 +68,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -64,12 +78,18 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -82,16 +102,28 @@ import com.creditinform.app.data.RelayStatus
 import com.creditinform.app.data.RemoteMonitorConfig
 import com.creditinform.app.data.RemoteMonitorConfigStatus
 import com.creditinform.app.data.RemoteMonitorStatus
-import com.creditinform.app.data.RemoteMonitorTestResult
 import com.creditinform.app.monitoring.AlarmController
 import com.creditinform.app.monitoring.NotificationChannels
 import com.creditinform.app.monitoring.RelayService
 import com.creditinform.app.monitoring.UrgentAlarm
 import com.creditinform.app.network.RelayApiException
 import com.creditinform.app.ui.CreditInformTheme
+import com.creditinform.app.ui.MonitorValueTone
 import com.creditinform.app.ui.RemoteMonitorEditorScreen
+import com.creditinform.app.ui.RemoteMonitorRow
+import com.creditinform.app.ui.mergeRemoteMonitorRows
+import com.creditinform.app.ui.monitorTestErrorMessage
+import com.creditinform.app.ui.monitorValueTone
+import com.creditinform.app.ui.moveRemoteMonitorId
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.text.DateFormat
+import java.text.SimpleDateFormat
+import java.util.Locale
+
+private const val MONITOR_ITEM_KEY_PREFIX = "monitor:"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -118,16 +150,18 @@ private fun RelayAlarmApp() {
     var testing by remember { mutableStateOf(false) }
     var sending by remember { mutableStateOf(false) }
     var refreshing by remember { mutableStateOf(false) }
+    var refreshProgressText by remember { mutableStateOf("") }
     var adminLoading by remember { mutableStateOf(false) }
     var adminError by remember { mutableStateOf("") }
     var adminActionId by remember { mutableStateOf<String?>(null) }
+    var copyActionId by remember { mutableStateOf<String?>(null) }
+    var reordering by remember { mutableStateOf(false) }
     var showMonitorEditor by remember { mutableStateOf(false) }
     var editingMonitor by remember { mutableStateOf<RemoteMonitorConfig?>(null) }
     var editorSaving by remember { mutableStateOf(false) }
     var editorError by remember { mutableStateOf("") }
     var deleteTarget by remember { mutableStateOf<RemoteMonitorConfig?>(null) }
     var deleteError by remember { mutableStateOf("") }
-    var testFeedback by remember { mutableStateOf<MonitorTestFeedback?>(null) }
     var showConfiguration by rememberSaveable { mutableStateOf(false) }
     var showSendConfirmation by rememberSaveable { mutableStateOf(false) }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -154,7 +188,7 @@ private fun RelayAlarmApp() {
         }
     }
 
-    LaunchedEffect(config.serverUrl, config.groupId, config.adminToken) {
+    LaunchedEffect(config.serverUrl, config.adminToken) {
         adminError = ""
         if (config.adminToken.isNotBlank()) {
             adminLoading = true
@@ -232,19 +266,41 @@ private fun RelayAlarmApp() {
             testing = testing,
             sending = sending,
             refreshing = refreshing,
+            refreshProgressText = refreshProgressText,
             adminLoading = adminLoading,
             adminError = adminError,
             adminActionId = adminActionId,
+            copyActionId = copyActionId,
+            reordering = reordering,
             permissionRevision = permissionRevision,
             onOpenConfiguration = { showConfiguration = true },
             onTestConnection = {
                 scope.launch {
                     testing = true
-                    repository.testConnection()
+                    val connectionResult = repository.testConnection()
+                    connectionResult
                         .onSuccess { health ->
+                            refreshing = true
+                            val syncErrors = mutableListOf<String>()
+                            repository.refreshMonitors().onFailure { error ->
+                                syncErrors += "同步监控值失败：${error.readableMessage()}"
+                            }
+                            if (config.hasAdminAccess) {
+                                adminLoading = true
+                                repository.listRemoteMonitorConfigs().onFailure { error ->
+                                    syncErrors += "同步监控配置失败：${error.readableMessage()}"
+                                }
+                                adminLoading = false
+                            }
+                            refreshing = false
+                            adminError = syncErrors.joinToString("\n")
                             Toast.makeText(
                                 context,
-                                "连接成功，在线客户端 ${health.onlineClients} 个",
+                                if (syncErrors.isEmpty()) {
+                                    "连接成功，已同步最新值，在线客户端 ${health.onlineClients} 个"
+                                } else {
+                                    "连接成功，但部分监控数据同步失败"
+                                },
                                 Toast.LENGTH_SHORT
                             ).show()
                         }
@@ -276,25 +332,39 @@ private fun RelayAlarmApp() {
             },
             onRefreshMonitors = {
                 scope.launch {
+                    val isAdmin = config.hasAdminAccess
                     refreshing = true
-                    repository.refreshMonitors().onFailure { error ->
-                        Toast.makeText(
-                            context,
-                            "刷新失败：${error.readableMessage()}",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    }
-                    refreshing = false
-                }
-            },
-            onRefreshAdmin = {
-                scope.launch {
-                    adminLoading = true
+                    adminLoading = isAdmin
                     adminError = ""
-                    repository.listRemoteMonitorConfigs().onFailure { error ->
-                        adminError = "加载监控配置失败：${error.readableMessage()}"
+                    val errors = mutableListOf<String>()
+                    try {
+                        if (isAdmin) {
+                            refreshProgressText = "正在检测并同步全部已启用监控…"
+                            repository.refreshRemoteMonitorValues()
+                                .onSuccess { result ->
+                                    if (result.failed > 0) {
+                                        errors += "部分检测失败：${result.failed}/${result.total} 项"
+                                    }
+                                }
+                                .onFailure { error ->
+                                    errors += "检测刷新失败：${error.readableMessage()}"
+                                }
+                            refreshProgressText = "正在同步监控配置…"
+                            repository.listRemoteMonitorConfigs().onFailure { error ->
+                                errors += "配置同步失败：${error.readableMessage()}"
+                            }
+                        } else {
+                            refreshProgressText = "正在同步最新监控值…"
+                            repository.refreshMonitors().onFailure { error ->
+                                errors += "刷新运行状态失败：${error.readableMessage()}"
+                            }
+                        }
+                        adminError = errors.joinToString("\n")
+                    } finally {
+                        refreshProgressText = ""
+                        adminLoading = false
+                        refreshing = false
                     }
-                    adminLoading = false
                 }
             },
             onCreateMonitor = {
@@ -311,19 +381,61 @@ private fun RelayAlarmApp() {
                 deleteTarget = monitor
                 deleteError = ""
             },
+            onCopyMonitor = { monitor ->
+                scope.launch {
+                    copyActionId = monitor.id
+                    adminError = ""
+                    repository.copyRemoteMonitor(monitor.id)
+                        .onSuccess {
+                            Toast.makeText(
+                                context,
+                                "已复制，副本默认停用",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            repository.refreshMonitors().onFailure { error ->
+                                adminError = "刷新运行状态失败：${error.readableMessage()}"
+                            }
+                        }
+                        .onFailure { error ->
+                            adminError = "复制失败：${error.readableMessage()}"
+                            Toast.makeText(context, adminError, Toast.LENGTH_LONG).show()
+                        }
+                    copyActionId = null
+                }
+            },
+            onReorderMonitors = { expectedIds, orderedIds, onComplete ->
+                scope.launch {
+                    reordering = true
+                    adminError = ""
+                    repository.reorderRemoteMonitors(expectedIds, orderedIds)
+                        .onSuccess {
+                            onComplete(true)
+                        }
+                        .onFailure { error ->
+                            adminError = "保存排序失败：${error.readableMessage()}"
+                            onComplete(false)
+                            repository.listRemoteMonitorConfigs()
+                            Toast.makeText(context, adminError, Toast.LENGTH_LONG).show()
+                        }
+                    reordering = false
+                }
+            },
             onTestMonitor = { monitor ->
                 scope.launch {
                     adminActionId = monitor.id
-                    repository.testRemoteMonitor(monitor.id)
-                        .onSuccess { result ->
-                            testFeedback = MonitorTestFeedback(monitor.name, result = result)
-                        }
-                        .onFailure { error ->
-                            testFeedback = MonitorTestFeedback(
-                                monitorName = monitor.name,
-                                error = error.readableMessage()
-                            )
-                        }
+                    adminError = ""
+                    val testResult = repository.testRemoteMonitor(monitor.id)
+                    val refreshResult = repository.refreshMonitors()
+                    adminError = monitorTestErrorMessage(
+                        monitorName = monitor.name,
+                        testError = testResult.exceptionOrNull()?.readableMessage(),
+                        refreshError = refreshResult.exceptionOrNull()?.readableMessage()
+                    )
+                    Toast.makeText(
+                        context,
+                        adminError.ifBlank { "${monitor.name} 测试完成" },
+                        if (adminError.isBlank()) Toast.LENGTH_SHORT else Toast.LENGTH_LONG
+                    ).show()
                     adminActionId = null
                 }
             }
@@ -452,9 +564,6 @@ private fun RelayAlarmApp() {
         )
     }
 
-    testFeedback?.let { feedback ->
-        RemoteMonitorTestDialog(feedback = feedback, onDismiss = { testFeedback = null })
-    }
 }
 
 @Composable
@@ -467,40 +576,117 @@ private fun RelayHomeScreen(
     testing: Boolean,
     sending: Boolean,
     refreshing: Boolean,
+    refreshProgressText: String,
     adminLoading: Boolean,
     adminError: String,
     adminActionId: String?,
+    copyActionId: String?,
+    reordering: Boolean,
     permissionRevision: Int,
     onOpenConfiguration: () -> Unit,
     onTestConnection: () -> Unit,
     onRequestSendAlarm: () -> Unit,
     onTestLocalAlarm: () -> Unit,
     onRefreshMonitors: () -> Unit,
-    onRefreshAdmin: () -> Unit,
     onCreateMonitor: () -> Unit,
     onEditMonitor: (RemoteMonitorConfig) -> Unit,
     onDeleteMonitor: (RemoteMonitorConfig) -> Unit,
+    onCopyMonitor: (RemoteMonitorConfig) -> Unit,
+    onReorderMonitors: (List<String>, List<String>, (Boolean) -> Unit) -> Unit,
     onTestMonitor: (RemoteMonitorConfig) -> Unit
 ) {
+    val listState = rememberLazyListState()
+    val dragScope = rememberCoroutineScope()
+    val configuredIds = remoteMonitorConfigs.map(RemoteMonitorConfig::id)
+    val orderedIds = remember {
+        mutableStateListOf<String>().apply { addAll(configuredIds) }
+    }
+    var draggedMonitorId by remember { mutableStateOf<String?>(null) }
+    var draggedDistance by remember { mutableFloatStateOf(0f) }
+    var orderBeforeDrag by remember { mutableStateOf<List<String>>(emptyList()) }
+    val autoScroll = remember { DragAutoScrollState() }
+    val edgeScrollThreshold = with(LocalDensity.current) { 72.dp.toPx() }
+
+    LaunchedEffect(configuredIds) {
+        if (draggedMonitorId == null && orderedIds.toList() != configuredIds) {
+            orderedIds.clear()
+            orderedIds.addAll(configuredIds)
+        }
+    }
+
+    val configsById = remoteMonitorConfigs.associateBy(RemoteMonitorConfig::id)
+    val effectiveOrder = orderedIds.filter { it in configsById } +
+        configuredIds.filterNot { it in orderedIds }
+    val orderedConfigs = effectiveOrder.mapNotNull(configsById::get)
+    val monitorRows = mergeRemoteMonitorRows(orderedConfigs, monitors)
+
+    fun reorderVisibleMonitor(draggedId: String) {
+        val visibleItems = listState.layoutInfo.visibleItemsInfo
+        val draggedItem = visibleItems.firstOrNull {
+            it.key == "$MONITOR_ITEM_KEY_PREFIX$draggedId"
+        } ?: return
+        val draggedCenter = draggedItem.offset + draggedDistance + draggedItem.size / 2f
+        val currentOrderIndex = orderedIds.indexOf(draggedId)
+        if (currentOrderIndex < 0) return
+        val candidates = visibleItems.mapNotNull { item ->
+            val key = item.key as? String ?: return@mapNotNull null
+            if (!key.startsWith(MONITOR_ITEM_KEY_PREFIX)) return@mapNotNull null
+            val id = key.removePrefix(MONITOR_ITEM_KEY_PREFIX)
+            val orderIndex = orderedIds.indexOf(id)
+            if (id == draggedId || orderIndex < 0) return@mapNotNull null
+            DragTarget(item, id, orderIndex, item.offset + item.size / 2f)
+        }
+        val target = candidates
+            .filter { it.orderIndex > currentOrderIndex && draggedCenter > it.center }
+            .maxByOrNull(DragTarget::orderIndex)
+            ?: candidates
+                .filter { it.orderIndex < currentOrderIndex && draggedCenter < it.center }
+                .minByOrNull(DragTarget::orderIndex)
+            ?: return
+        val reordered = moveRemoteMonitorId(orderedIds, draggedId, target.id)
+        if (reordered != orderedIds) {
+            orderedIds.clear()
+            orderedIds.addAll(reordered)
+            draggedDistance += draggedItem.offset - target.item.offset
+        }
+    }
+
+    fun edgeScrollSpeed(draggedId: String): Float {
+        val draggedItem = listState.layoutInfo.visibleItemsInfo.firstOrNull {
+            it.key == "$MONITOR_ITEM_KEY_PREFIX$draggedId"
+        } ?: return 0f
+        val draggedTop = draggedItem.offset + draggedDistance
+        val draggedBottom = draggedTop + draggedItem.size
+        val viewportStart = listState.layoutInfo.viewportStartOffset
+        val viewportEnd = listState.layoutInfo.viewportEndOffset
+        return when {
+            draggedTop < viewportStart + edgeScrollThreshold ->
+                (draggedTop - viewportStart - edgeScrollThreshold).coerceAtLeast(-32f)
+            draggedBottom > viewportEnd - edgeScrollThreshold ->
+                (draggedBottom - viewportEnd + edgeScrollThreshold).coerceAtMost(32f)
+            else -> 0f
+        }
+    }
+
+    fun stopAutoScroll() {
+        autoScroll.speed = 0f
+        autoScroll.job?.cancel()
+        autoScroll.job = null
+    }
+
     Scaffold { scaffoldPadding ->
         LazyColumn(
+            state = listState,
             modifier = Modifier.fillMaxSize().padding(scaffoldPadding),
             contentPadding = PaddingValues(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(
-                        "值守报警",
-                        style = MaterialTheme.typography.headlineMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        config.deviceName.ifBlank { "本机尚未配置" },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                Text(
+                    "值守报警",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold
+                )
             }
             item {
                 RelayConnectionCard(
@@ -517,13 +703,28 @@ private fun RelayHomeScreen(
             item { PermissionChecklist(permissionRevision) }
             item {
                 RemoteMonitorHeader(
-                    count = monitors.size,
-                    refreshing = refreshing,
+                    count = monitorRows.size,
+                    loading = refreshing || adminLoading || reordering,
                     canRefresh = config.enabled && config.isCompleteForUi(),
-                    onRefresh = onRefreshMonitors
+                    canManage = config.hasAdminAccess,
+                    onRefresh = onRefreshMonitors,
+                    onCreate = onCreateMonitor
                 )
             }
-            if (refreshing) item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
+            if (refreshing || adminLoading || reordering) {
+                item {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        if (refreshProgressText.isNotBlank()) {
+                            Text(
+                                refreshProgressText,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
+                    }
+                }
+            }
             if (monitorConfigStatus.lastError.isNotBlank()) {
                 item {
                     Text(
@@ -533,59 +734,94 @@ private fun RelayHomeScreen(
                     )
                 }
             }
-            if (monitors.isEmpty() && !refreshing) {
-                item { EmptyMonitorState(config, monitorConfigStatus) }
-            } else {
-                items(monitors, key = { "status:${it.id}" }) { RemoteMonitorCard(it) }
-            }
-            if (config.adminToken.isNotBlank()) {
+            if (adminError.isNotBlank()) {
                 item {
-                    Spacer(Modifier.height(4.dp))
-                    HorizontalDivider()
-                    Spacer(Modifier.height(4.dp))
-                }
-                item {
-                    RemoteMonitorAdminHeader(
-                        count = remoteMonitorConfigs.size,
-                        loading = adminLoading,
-                        canManage = config.hasAdminAccess,
-                        onRefresh = onRefreshAdmin,
-                        onCreate = onCreateMonitor
+                    Text(
+                        adminError,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium
                     )
                 }
-                if (adminLoading) {
-                    item { LinearProgressIndicator(modifier = Modifier.fillMaxWidth()) }
-                }
-                if (adminError.isNotBlank()) {
-                    item {
-                        Text(
-                            adminError,
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    }
-                }
-                if (remoteMonitorConfigs.isEmpty() && !adminLoading) {
-                    item {
-                        Card(modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                "服务端尚无可管理的监控配置",
-                                modifier = Modifier.padding(20.dp),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+            }
+            if (monitorRows.isEmpty() && !refreshing && !adminLoading) {
+                item { EmptyMonitorState(config, monitorConfigStatus) }
+            } else {
+                items(monitorRows, key = { "$MONITOR_ITEM_KEY_PREFIX${it.id}" }) { row ->
+                    val monitorConfig = row.config
+                    val showDragHandle = config.hasAdminAccess && monitorConfig != null &&
+                        orderedConfigs.size > 1
+                    val canDrag = showDragHandle &&
+                        !adminLoading && adminActionId == null && copyActionId == null && !reordering
+                        && (draggedMonitorId == row.id ||
+                            (draggedMonitorId == null && orderedIds.toList() == configuredIds))
+                    UnifiedRemoteMonitorCard(
+                        row = row,
+                        canManage = config.hasAdminAccess && monitorConfig != null,
+                        showDragHandle = showDragHandle,
+                        canDrag = canDrag,
+                        actionInProgress = adminLoading || adminActionId != null ||
+                            copyActionId != null || reordering,
+                        testing = adminActionId == row.id,
+                        copying = copyActionId == row.id,
+                        isDragging = draggedMonitorId == row.id,
+                        dragOffset = if (draggedMonitorId == row.id) draggedDistance else 0f,
+                        onEdit = { monitorConfig?.let(onEditMonitor) },
+                        onDelete = { monitorConfig?.let(onDeleteMonitor) },
+                        onCopy = { monitorConfig?.let(onCopyMonitor) },
+                        onTest = { monitorConfig?.let(onTestMonitor) },
+                        onDragStart = {
+                            orderBeforeDrag = orderedIds.toList()
+                            draggedMonitorId = row.id
+                            draggedDistance = 0f
+                        },
+                        onDrag = { delta ->
+                            if (draggedMonitorId == row.id) {
+                                draggedDistance += delta
+                                reorderVisibleMonitor(row.id)
+                                autoScroll.speed = edgeScrollSpeed(row.id)
+                                if (autoScroll.speed != 0f && autoScroll.job?.isActive != true) {
+                                    val job = dragScope.launch {
+                                        while (isActive && draggedMonitorId == row.id &&
+                                            autoScroll.speed != 0f
+                                        ) {
+                                            val consumed = listState.scrollBy(autoScroll.speed)
+                                            if (consumed == 0f) break
+                                            draggedDistance += consumed
+                                            reorderVisibleMonitor(row.id)
+                                            autoScroll.speed = edgeScrollSpeed(row.id)
+                                            delay(16)
+                                        }
+                                    }
+                                    autoScroll.job = job
+                                    job.invokeOnCompletion {
+                                        if (autoScroll.job === job) autoScroll.job = null
+                                    }
+                                }
+                            }
+                        },
+                        onDragEnd = {
+                            stopAutoScroll()
+                            val expectedIds = orderBeforeDrag
+                            val updatedIds = orderedIds.toList()
+                            draggedMonitorId = null
+                            draggedDistance = 0f
+                            if (expectedIds.isNotEmpty() && expectedIds != updatedIds) {
+                                onReorderMonitors(expectedIds, updatedIds) { saved ->
+                                    if (!saved) {
+                                        orderedIds.clear()
+                                        orderedIds.addAll(expectedIds)
+                                    }
+                                }
+                            }
+                        },
+                        onDragCancel = {
+                            stopAutoScroll()
+                            orderedIds.clear()
+                            orderedIds.addAll(orderBeforeDrag)
+                            draggedMonitorId = null
+                            draggedDistance = 0f
                         }
-                    }
-                } else {
-                    items(remoteMonitorConfigs, key = { "config:${it.id}" }) { monitor ->
-                        RemoteMonitorAdminCard(
-                            monitor = monitor,
-                            actionInProgress = adminLoading || adminActionId != null,
-                            testing = adminActionId == monitor.id,
-                            onEdit = { onEditMonitor(monitor) },
-                            onDelete = { onDeleteMonitor(monitor) },
-                            onTest = { onTestMonitor(monitor) }
-                        )
-                    }
+                    )
                 }
             }
         }
@@ -605,7 +841,7 @@ private fun RelayConnectionCard(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = presentation.containerColor())
     ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     Modifier.size(10.dp).background(presentation.indicatorColor(), CircleShape)
@@ -621,34 +857,22 @@ private fun RelayConnectionCard(
                         presentation.detail,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 3,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
                 }
             }
-            if (config.serverUrl.isNotBlank()) {
-                Text(
-                    displayUrlWithoutQuery(config.serverUrl),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    "通信组：${config.groupId.ifBlank { "未配置" }}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = onOpenConfiguration,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f).height(40.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp)
                 ) { Text("连接配置") }
                 Button(
                     onClick = onTestConnection,
                     enabled = config.isCompleteForUi() && !testing,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f).height(40.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp)
                 ) { Text(if (testing) "检测中" else "检测连接") }
             }
         }
@@ -663,25 +887,32 @@ private fun ManualAlarmCard(
     onTestLocalAlarm: () -> Unit
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
                 "手动报警",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold
             )
-            Button(
-                onClick = onRequestSendAlarm,
-                enabled = config.enabled && config.isCompleteForUi() && !sending,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error,
-                    contentColor = MaterialTheme.colorScheme.onError
-                ),
-                modifier = Modifier.fillMaxWidth().height(52.dp)
-            ) { Text(if (sending) "正在发送" else "向其他客户端报警") }
-            OutlinedButton(
-                onClick = onTestLocalAlarm,
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("测试本机报警") }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onRequestSendAlarm,
+                    enabled = config.enabled && config.isCompleteForUi() && !sending,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError
+                    ),
+                    modifier = Modifier.weight(1f).height(44.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp)
+                ) { Text(if (sending) "发送中" else "发送报警", maxLines = 1) }
+                OutlinedButton(
+                    onClick = onTestLocalAlarm,
+                    modifier = Modifier.weight(1f).height(44.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp)
+                ) { Text("测试本机", maxLines = 1) }
+            }
         }
     }
 }
@@ -689,94 +920,243 @@ private fun ManualAlarmCard(
 @Composable
 private fun RemoteMonitorHeader(
     count: Int,
-    refreshing: Boolean,
-    canRefresh: Boolean,
-    onRefresh: () -> Unit
-) {
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            "服务端监控 ($count)",
-            style = MaterialTheme.typography.titleLarge,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.weight(1f)
-        )
-        TextButton(onClick = onRefresh, enabled = canRefresh && !refreshing) {
-            Text(if (refreshing) "刷新中" else "刷新")
-        }
-    }
-}
-
-@Composable
-private fun RemoteMonitorAdminHeader(
-    count: Int,
     loading: Boolean,
+    canRefresh: Boolean,
     canManage: Boolean,
     onRefresh: () -> Unit,
     onCreate: () -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                "监控配置管理 ($count)",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.weight(1f)
-            )
-            TextButton(onClick = onRefresh, enabled = canManage && !loading) {
-                Text(if (loading) "加载中" else "重新加载")
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            "服务端监控与配置 ($count)",
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.weight(1f)
+        )
+        if (canManage) {
+            IconButton(onClick = onCreate, enabled = !loading) {
+                Icon(Icons.Filled.Add, contentDescription = "新增服务端监控")
             }
         }
-        Button(
-            onClick = onCreate,
-            enabled = canManage && !loading,
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("新增服务端监控") }
+        IconButton(onClick = onRefresh, enabled = canRefresh && !loading) {
+            Icon(Icons.Filled.Refresh, contentDescription = "刷新服务端监控")
+        }
     }
 }
 
 @Composable
-private fun RemoteMonitorAdminCard(
-    monitor: RemoteMonitorConfig,
+private fun UnifiedRemoteMonitorCard(
+    row: RemoteMonitorRow,
+    canManage: Boolean,
+    showDragHandle: Boolean,
+    canDrag: Boolean,
     actionInProgress: Boolean,
     testing: Boolean,
+    copying: Boolean,
+    isDragging: Boolean,
+    dragOffset: Float,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
-    onTest: () -> Unit
+    onCopy: () -> Unit,
+    onTest: () -> Unit,
+    onDragStart: () -> Unit,
+    onDrag: (Float) -> Unit,
+    onDragEnd: () -> Unit,
+    onDragCancel: () -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+    val config = row.config
+    val status = row.status
+    val name = config?.name ?: status?.name.orEmpty().ifBlank { row.id }
+    val threshold = status?.threshold ?: config?.threshold ?: 0.0
+    val operator = status?.operator ?: config?.operator.orEmpty().ifBlank { "-" }
+    val address = config?.url.orEmpty().ifBlank { status?.url.orEmpty() }
+    val method = status?.method.orEmpty().ifBlank { config?.method.orEmpty() }
+    val valueTone = monitorValueTone(status?.lastValue, threshold, status?.breached == true)
+    val valueColor = when (valueTone) {
+        MonitorValueTone.NO_DATA -> MaterialTheme.colorScheme.onSurfaceVariant
+        MonitorValueTone.ALERT -> MaterialTheme.colorScheme.error
+        MonitorValueTone.WARNING -> Color(0xFFD97706)
+        MonitorValueTone.HEALTHY -> Color(0xFF1B8A4B)
+    }
+    val cardModifier = Modifier
+        .fillMaxWidth()
+        .zIndex(if (isDragging) 1f else 0f)
+        .graphicsLayer { translationY = dragOffset }
+
+    Card(
+        modifier = cardModifier,
+        colors = CardDefaults.cardColors(
+            containerColor = if (status?.breached == true) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.surface
+            }
+        ),
+        elevation = CardDefaults.cardElevation(
+            defaultElevation = if (isDragging) 8.dp else 1.dp
+        )
+    ) {
+        Column(
+            Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    monitor.name,
-                    style = MaterialTheme.typography.titleMedium,
+                    name,
+                    style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.weight(1f),
-                    maxLines = 2,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                StatusLabel(
-                    if (monitor.enabled) "已启用" else "已停用",
-                    if (monitor.enabled) Color(0xFF1B7F4B)
-                    else MaterialTheme.colorScheme.onSurfaceVariant
+                if (showDragHandle) {
+                    Spacer(Modifier.width(4.dp))
+                    val dragModifier = if (canDrag) {
+                        Modifier.pointerInput(row.id) {
+                            detectDragGesturesAfterLongPress(
+                                onDragStart = { onDragStart() },
+                                onDragEnd = onDragEnd,
+                                onDragCancel = onDragCancel,
+                                onDrag = { change, amount ->
+                                    change.consume()
+                                    onDrag(amount.y)
+                                }
+                            )
+                        }
+                    } else {
+                        Modifier
+                    }
+                    Box(
+                        modifier = Modifier.size(34.dp).then(dragModifier),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Filled.Menu,
+                            contentDescription = "长按拖动排序",
+                            tint = if (canDrag) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.outlineVariant
+                            }
+                        )
+                    }
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                CompactMonitorField(
+                    label = "当前值",
+                    value = status?.lastValue?.let(::formatNumber) ?: "尚无数据",
+                    color = valueColor,
+                    emphasize = true,
+                    modifier = Modifier.weight(1f)
+                )
+                CompactMonitorField(
+                    label = "报警条件",
+                    value = "$operator ${formatNumber(threshold)}",
+                    modifier = Modifier.weight(1f)
                 )
             }
-            LabeledText("请求", "${monitor.method} ${displayUrlWithoutQuery(monitor.url)}")
-            LabeledText("取值字段", monitor.jsonPath)
-            LabeledText("报警条件", "${monitor.operator} ${formatNumber(monitor.threshold)}")
-            LabeledText("配置版本", "${monitor.revision} | ${formatTimeOrNever(monitor.updatedAt)}")
+            Text(
+                "地址：" + (address.takeIf(String::isNotBlank)?.let {
+                    if (canManage) it else displayMaskedMonitorUrl(it)
+                } ?: "未配置"),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
             Row(
-                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Button(onClick = onTest, enabled = !actionInProgress) {
-                    Text(if (testing) "测试中" else "立即测试")
-                }
-                OutlinedButton(onClick = onEdit, enabled = !actionInProgress) { Text("编辑") }
-                TextButton(onClick = onDelete, enabled = !actionInProgress) {
-                    Text("删除", color = MaterialTheme.colorScheme.error)
+                CompactMonitorField(
+                    label = "最近检测",
+                    value = formatCompactTimeOrNever(status?.lastCheckAt ?: 0L),
+                    modifier = Modifier.weight(1f)
+                )
+                CompactMonitorField(
+                    label = "HTTP",
+                    value = listOfNotNull(
+                        method.takeIf(String::isNotBlank),
+                        status?.lastHttpCode?.toString()
+                    ).joinToString(" · ").ifBlank { "尚无记录" },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            if (canManage) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                        CompactMonitorActionButton(
+                            onClick = onTest,
+                            enabled = !actionInProgress,
+                            icon = Icons.Filled.PlayArrow,
+                            contentDescription = if (testing) "测试中" else "测试监控"
+                        )
+                    }
+                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                        CompactMonitorActionButton(
+                            onClick = onCopy,
+                            enabled = !actionInProgress,
+                            icon = Icons.Filled.AddCircle,
+                            contentDescription = if (copying) "复制中" else "复制监控"
+                        )
+                    }
+                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                        CompactMonitorActionButton(
+                            onClick = onEdit,
+                            enabled = !actionInProgress,
+                            icon = Icons.Filled.Edit,
+                            contentDescription = "编辑监控"
+                        )
+                    }
+                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
+                        CompactMonitorActionButton(
+                            onClick = onDelete,
+                            enabled = !actionInProgress,
+                            icon = Icons.Filled.Delete,
+                            contentDescription = "删除监控",
+                            contentColor = MaterialTheme.colorScheme.error
+                        )
+                    }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun CompactMonitorActionButton(
+    onClick: () -> Unit,
+    enabled: Boolean,
+    icon: ImageVector,
+    contentDescription: String,
+    contentColor: Color = MaterialTheme.colorScheme.onSurfaceVariant
+) {
+    val colorAlpha = if (enabled) 1f else 0.38f
+    Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .clickable(enabled = enabled, onClick = onClick)
+            .border(
+                width = 1.dp,
+                color = MaterialTheme.colorScheme.outline.copy(alpha = colorAlpha),
+                shape = CircleShape
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            modifier = Modifier.size(18.dp),
+            tint = contentColor.copy(alpha = colorAlpha)
+        )
     }
 }
 
@@ -800,58 +1180,6 @@ private fun EmptyMonitorState(
 }
 
 @Composable
-private fun RemoteMonitorCard(monitor: RemoteMonitorStatus) {
-    val state = when {
-        !monitor.enabled -> MonitorPresentation("已停用", MaterialTheme.colorScheme.onSurfaceVariant)
-        monitor.breached -> MonitorPresentation("已报警", MaterialTheme.colorScheme.error)
-        monitor.lastError.isNotBlank() -> MonitorPresentation("检测异常", Color(0xFFD97706))
-        monitor.lastCheckAt == 0L -> MonitorPresentation("等待检测", MaterialTheme.colorScheme.onSurfaceVariant)
-        else -> MonitorPresentation("正常", Color(0xFF1B7F4B))
-    }
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (monitor.breached) {
-                MaterialTheme.colorScheme.errorContainer
-            } else MaterialTheme.colorScheme.surface
-        )
-    ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    monitor.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.weight(1f),
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-                StatusLabel(state.label, state.color)
-            }
-            HorizontalDivider()
-            LabeledText(
-                "当前值",
-                monitor.lastValue?.let(::formatNumber) ?: "尚无数据",
-                if (monitor.breached) MaterialTheme.colorScheme.error
-                else MaterialTheme.colorScheme.onSurface
-            )
-            LabeledText("报警条件", "${monitor.operator} ${formatNumber(monitor.threshold)}")
-            LabeledText("最近检测", formatTimeOrNever(monitor.lastCheckAt))
-            monitor.lastHttpCode?.let { LabeledText("HTTP", it.toString()) }
-            if (monitor.lastError.isNotBlank()) {
-                Text(
-                    monitor.lastError,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun StatusLabel(text: String, color: Color) {
     Box(
         Modifier.background(color, RoundedCornerShape(6.dp))
@@ -860,23 +1188,30 @@ private fun StatusLabel(text: String, color: Color) {
 }
 
 @Composable
-private fun LabeledText(
+private fun CompactMonitorField(
     label: String,
     value: String,
-    color: Color = MaterialTheme.colorScheme.onSurface
+    color: Color = MaterialTheme.colorScheme.onSurface,
+    emphasize: Boolean = false,
+    modifier: Modifier = Modifier
 ) {
-    Row(modifier = Modifier.fillMaxWidth()) {
+    Column(modifier = modifier) {
         Text(
-            "$label：",
+            label,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodyMedium
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1
         )
         Text(
             value,
             color = color,
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.weight(1f),
-            maxLines = 2,
+            style = if (emphasize) {
+                MaterialTheme.typography.titleMedium
+            } else {
+                MaterialTheme.typography.bodySmall
+            },
+            fontWeight = if (emphasize) FontWeight.Bold else FontWeight.Normal,
+            maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
     }
@@ -890,10 +1225,8 @@ private fun RelayConfigurationDialog(
     onSaveAndTest: (RelayConfig) -> Unit
 ) {
     var serverUrl by rememberSaveable { mutableStateOf(current.serverUrl) }
-    var groupId by rememberSaveable { mutableStateOf(current.groupId) }
     var sharedToken by remember(current.sharedToken) { mutableStateOf(current.sharedToken) }
     var adminToken by remember(current.adminToken) { mutableStateOf(current.adminToken) }
-    var deviceName by rememberSaveable { mutableStateOf(current.deviceName) }
     var enabled by rememberSaveable { mutableStateOf(current.enabled) }
     var validationError by remember { mutableStateOf("") }
     AlertDialog(
@@ -914,13 +1247,6 @@ private fun RelayConfigurationDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
-                    value = groupId,
-                    onValueChange = { groupId = it },
-                    label = { Text("通信组") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
                     value = sharedToken,
                     onValueChange = { sharedToken = it },
                     label = { Text("共享密钥") },
@@ -933,14 +1259,6 @@ private fun RelayConfigurationDialog(
                     onValueChange = { adminToken = it },
                     label = { Text("管理员密钥（可选）") },
                     visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = deviceName,
-                    onValueChange = { deviceName = it },
-                    label = { Text("客户端名称") },
-                    placeholder = { Text("例如：客服端、我的手机") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -967,20 +1285,15 @@ private fun RelayConfigurationDialog(
                 onClick = {
                     val candidate = current.copy(
                         serverUrl = serverUrl.trim().trimEnd('/'),
-                        groupId = groupId.trim(),
                         sharedToken = sharedToken.trim(),
                         adminToken = adminToken.trim(),
-                        deviceName = deviceName.trim(),
                         enabled = enabled
                     )
                     validationError = when {
                         !candidate.serverUrl.startsWith("https://") &&
                             !candidate.serverUrl.startsWith("http://") ->
                             "服务端地址必须以 http:// 或 https:// 开头"
-                        !RelayConfig.isValidGroupId(candidate.groupId) ->
-                            "通信组必须为 1 到 64 位字母、数字、点、下划线或短横线"
                         candidate.sharedToken.isBlank() -> "请填写共享密钥"
-                        candidate.deviceName.isBlank() -> "请填写客户端名称"
                         else -> ""
                     }
                     if (validationError.isEmpty()) onSaveAndTest(candidate)
@@ -1003,7 +1316,7 @@ private fun SendAlarmDialog(
         title = { Text("发送手动报警？") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("同一通信组内的其他客户端会立即响铃。")
+                Text("其他客户端会立即响铃。")
                 OutlinedTextField(
                     value = message,
                     onValueChange = { if (it.length <= 500) message = it },
@@ -1062,50 +1375,6 @@ private fun DeleteRemoteMonitorDialog(
         dismissButton = {
             TextButton(onClick = onDismiss, enabled = !deleting) { Text("取消") }
         }
-    )
-}
-
-private data class MonitorTestFeedback(
-    val monitorName: String,
-    val result: RemoteMonitorTestResult? = null,
-    val error: String = ""
-)
-
-@Composable
-private fun RemoteMonitorTestDialog(
-    feedback: MonitorTestFeedback,
-    onDismiss: () -> Unit
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("${feedback.monitorName} 测试结果") },
-        text = {
-            val result = feedback.result
-            if (result == null) {
-                Text(
-                    "测试失败：${feedback.error.ifBlank { "服务端未返回结果" }}",
-                    color = MaterialTheme.colorScheme.error
-                )
-            } else {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    LabeledText("HTTP", result.httpCode.toString())
-                    LabeledText("接口原始值", result.rawValue?.let(::formatNumber) ?: "未取得")
-                    LabeledText("换算后数值", result.value?.let(::formatNumber) ?: "未取得")
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            "报警判断：",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        StatusLabel(
-                            if (result.breached) "已越界" else "正常",
-                            if (result.breached) MaterialTheme.colorScheme.error
-                            else Color(0xFF1B7F4B)
-                        )
-                    }
-                }
-            }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("关闭") } }
     )
 }
 
@@ -1235,7 +1504,17 @@ private data class RelayStatusPresentation(
 }
 
 private enum class RelayStatusKind { ONLINE, CHECKING, OFFLINE, DISABLED }
-private data class MonitorPresentation(val label: String, val color: Color)
+private class DragAutoScrollState {
+    var job: Job? = null
+    var speed: Float = 0f
+}
+
+private data class DragTarget(
+    val item: androidx.compose.foundation.lazy.LazyListItemInfo,
+    val id: String,
+    val orderIndex: Int,
+    val center: Float
+)
 
 private fun relayStatusPresentation(
     config: RelayConfig,
@@ -1252,14 +1531,14 @@ private fun relayStatusPresentation(
     if (!config.isCompleteForUi()) {
         return RelayStatusPresentation(
             "配置待完成",
-            "服务器、通信组、密钥和客户端名称均为必填项",
+            "服务端地址和共享密钥为必填项",
             RelayStatusKind.OFFLINE
         )
     }
     if (testing || status.state == RelayConnectionState.CHECKING) {
         return RelayStatusPresentation(
             "正在检测服务端",
-            "正在验证地址、通信组和凭据",
+            "正在验证服务端地址和凭据",
             RelayStatusKind.CHECKING
         )
     }
@@ -1276,7 +1555,7 @@ private fun relayStatusPresentation(
         )
         RelayConnectionState.CHECKING -> RelayStatusPresentation(
             "正在检测服务端",
-            "正在验证地址、通信组和凭据",
+            "正在验证服务端地址和凭据",
             RelayStatusKind.CHECKING
         )
         RelayConnectionState.DISABLED -> RelayStatusPresentation(
@@ -1289,20 +1568,41 @@ private fun relayStatusPresentation(
 
 private fun RelayConfig.isCompleteForUi(): Boolean =
     (serverUrl.startsWith("https://") || serverUrl.startsWith("http://")) &&
-        RelayConfig.isValidGroupId(groupId) && sharedToken.isNotBlank() &&
-        deviceId.isNotBlank() && deviceName.isNotBlank()
+        sharedToken.isNotBlank() && RelayConfig.isValidIdentifier(deviceId)
 
 private fun formatTimeOrNever(timestamp: Long): String =
     if (timestamp <= 0L) "尚无记录" else DateFormat.getDateTimeInstance().format(timestamp)
+
+private fun formatCompactTimeOrNever(timestamp: Long): String =
+    if (timestamp <= 0L) {
+        "尚无记录"
+    } else {
+        SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(timestamp)
+    }
 
 private fun formatNumber(value: Double): String =
     if (value % 1.0 == 0.0) value.toLong().toString()
     else "%.6f".format(value).trimEnd('0').trimEnd('.')
 
-private fun displayUrlWithoutQuery(value: String): String = runCatching {
+private fun displayMaskedMonitorUrl(value: String): String = runCatching {
     val uri = java.net.URI(value)
-    java.net.URI(uri.scheme, null, uri.host, uri.port, uri.path, null, null).toString()
-}.getOrDefault(value.substringBefore('?').substringBefore('#'))
+    require(uri.scheme == "http" || uri.scheme == "https")
+    val host = requireNotNull(uri.host)
+    val displayHost = if (':' in host) "[$host]" else host
+    val maskedQuery = uri.rawQuery
+        ?.takeIf(String::isNotBlank)
+        ?.split('&')
+        ?.joinToString("&") { field ->
+            val name = field.substringBefore('=').ifBlank { "key" }
+            "$name=****"
+        }
+    buildString {
+        append(uri.scheme).append("://").append(displayHost)
+        if (uri.port >= 0) append(':').append(uri.port)
+        append(uri.rawPath.orEmpty())
+        if (maskedQuery != null) append('?').append(maskedQuery)
+    }
+}.getOrDefault("地址格式无效")
 
 private fun Throwable.readableMessage(): String =
     message?.take(300)?.ifBlank { null } ?: javaClass.simpleName

@@ -75,6 +75,7 @@ class RelayApiTest {
         assertEquals(7L, registration.cursor)
         assertEquals(2, registration.onlineClients)
         assertEquals("instance-primary", registration.serverInstanceId)
+        assertEquals("registration-token-7", registration.cursorToken)
 
         val status = api.status(config)
         assertEquals("instance-primary", status.serverInstanceId)
@@ -82,14 +83,25 @@ class RelayApiTest {
         assertEquals(2, status.onlineClients)
         assertEquals(3, status.totalClients)
 
-        val poll = api.poll(config, after = 7, waitSeconds = 0)
+        val poll = api.poll(
+            config,
+            after = 7,
+            afterToken = "cursor/token +7",
+            waitSeconds = 0
+        )
         assertEquals(8L, poll.cursor)
         assertEquals(8L, poll.headCursor)
         assertEquals("instance-primary", poll.serverInstanceId)
+        assertEquals("poll-token-8", poll.cursorToken)
+        assertTrue(poll.cursorValid)
         assertEquals(RelayAlertType.MONITOR_BREACH, poll.events.single().type)
         assertEquals("balance", poll.events.single().monitorId)
         assertEquals("instance-primary", poll.events.single().serverInstanceId)
         assertEquals("uid:00000000000000000000000000000008", poll.events.single().acknowledgementKey)
+        assertTrue(
+            requests.single { it.path == "/api/v1/alerts" && it.method == "GET" }
+                .query.contains("afterToken=cursor%2Ftoken%20%2B7")
+        )
 
         val sent = api.sendAlarm(config, "Please investigate")
         assertEquals(3, sent.recipients)
@@ -102,8 +114,16 @@ class RelayApiTest {
         val configs = api.listMonitorConfigs(config)
         assertEquals(RemoteMonitorConfig.KEEP_PLACEHOLDER, configs.keepPlaceholder)
         assertEquals(3L, configs.monitors.single().revision)
-        assertEquals("{\"Authorization\":\"__KEEP__\"}", configs.monitors.single().headersJson)
-        assertTrue(configs.monitors.single().urlMasked)
+        assertEquals(
+            "{\"Authorization\":\"Bearer real-secret\"}",
+            configs.monitors.single().headersJson
+        )
+        assertEquals("{\"account\":\"secret\"}", configs.monitors.single().body)
+        assertEquals(
+            "https://user:password@business.example/api?token=real-token",
+            configs.monitors.single().url
+        )
+        assertFalse(configs.monitors.single().urlMasked)
         assertTrue(configs.monitors.single().headersConfigured)
         assertTrue(configs.monitors.single().bodyConfigured)
 
@@ -148,6 +168,20 @@ class RelayApiTest {
             assertEquals("Bearer shared-secret", it.authorization)
         }
         assertTrue(requests.any { it.path.contains("balance%20id") })
+        requests.forEach { captured ->
+            assertFalse(captured.query.contains("groupId="))
+            if (captured.body.isNotBlank()) {
+                assertFalse(JSONObject(captured.body).has("groupId"))
+            }
+        }
+        val registrationBody = JSONObject(
+            requests.single { it.path == "/api/v1/clients/register" }.body
+        )
+        assertFalse(registrationBody.has("clientName"))
+        val alertBody = JSONObject(
+            requests.single { it.path == "/api/v1/alerts" && it.method == "POST" }.body
+        )
+        assertFalse(alertBody.has("senderName"))
     }
 
     @Test
@@ -167,10 +201,40 @@ class RelayApiTest {
 
         assertNull(status.serverInstanceId)
         assertNull(registration.serverInstanceId)
+        assertNull(registration.cursorToken)
         assertNull(poll.serverInstanceId)
+        assertNull(poll.cursorToken)
+        assertTrue(poll.cursorValid)
         assertNull(poll.events.single().serverInstanceId)
         assertEquals("4", poll.events.single().acknowledgementKey)
+        assertFalse(
+            requests.single { it.path == "/api/v1/alerts" && it.method == "GET" }
+                .query.contains("afterToken=")
+        )
         requests.forEach { assertEquals("Bearer legacy-secret", it.authorization) }
+    }
+
+    @Test
+    fun `parses a rejected cursor token`() {
+        val api = RelayApi()
+        val config = RelayConfig(
+            serverUrl = "http://127.0.0.1:${serverSocket.localPort}",
+            groupId = "invalid-cursor",
+            sharedToken = "shared-secret",
+            deviceId = "owner-phone",
+            deviceName = "Owner"
+        )
+
+        val poll = api.poll(
+            config,
+            after = 8,
+            afterToken = "stale-token",
+            waitSeconds = 0
+        )
+
+        assertFalse(poll.cursorValid)
+        assertEquals("head-token-8", poll.cursorToken)
+        assertTrue(requests.single().query.contains("afterToken=stale-token"))
     }
 
     @Test
@@ -215,24 +279,30 @@ class RelayApiTest {
             body = request.body
         )
 
-        if (uri.rawQuery?.contains("groupId=forbidden") == true) {
+        if (request.headers["authorization"] == "Bearer wrong") {
             respond(socket.getOutputStream(), 401, "{\"error\":{\"code\":\"unauthorized\",\"message\":\"管理员密钥错误\"}}")
             return
         }
 
         val response = when {
-            uri.path == "/api/v1/status" && uri.rawQuery?.contains("groupId=legacy-team") == true ->
+            uri.path == "/api/v1/status" &&
+                request.headers["authorization"] == "Bearer legacy-secret" ->
                 """{"status":"ok","serverTime":99,"cursor":3,"clients":{"online":1,"total":1}}"""
             uri.path == "/api/v1/status" ->
                 """{"status":"ok","serverInstanceId":"instance-primary","serverTime":99,"cursor":8,"clients":{"online":2,"total":3}}"""
-            uri.path == "/api/v1/clients/register" && JSONObject(request.body).optString("groupId") == "legacy-team" ->
+            uri.path == "/api/v1/clients/register" &&
+                JSONObject(request.body).optString("clientId") == "legacy-phone" ->
                 """{"ok":true,"serverTime":99,"cursor":3,"clients":{"online":1,"total":1},"client":{"groupId":"legacy-team","id":"legacy-phone","name":"Legacy phone","lastSeenAt":99}}"""
             uri.path == "/api/v1/clients/register" ->
-                """{"ok":true,"serverInstanceId":"instance-primary","serverTime":99,"cursor":7,"clients":{"online":2,"total":3},"client":{"groupId":"night-team","id":"owner-phone","name":"Owner","lastSeenAt":99}}"""
-            uri.path == "/api/v1/alerts" && request.method == "GET" && uri.rawQuery?.contains("groupId=legacy-team") == true ->
+                """{"ok":true,"serverInstanceId":"instance-primary","serverTime":99,"cursor":7,"cursorToken":"registration-token-7","clients":{"online":2,"total":3},"client":{"groupId":"night-team","id":"owner-phone","name":"Owner","lastSeenAt":99}}"""
+            uri.path == "/api/v1/alerts" && request.method == "GET" &&
+                request.headers["authorization"] == "Bearer legacy-secret" ->
                 """{"serverTime":99,"cursor":4,"headCursor":4,"alerts":[{"id":4,"type":"manual","groupId":"legacy-team","senderId":"support","senderName":"Support","message":"Legacy alert","createdAt":98}]}"""
+            uri.path == "/api/v1/alerts" && request.method == "GET" &&
+                uri.rawQuery?.contains("afterToken=stale-token") == true ->
+                """{"serverInstanceId":"instance-primary","serverTime":99,"cursor":8,"headCursor":8,"cursorToken":"head-token-8","cursorValid":false,"alerts":[]}"""
             uri.path == "/api/v1/alerts" && request.method == "GET" ->
-                """{"serverInstanceId":"instance-primary","serverTime":99,"cursor":8,"headCursor":8,"alerts":[{"id":8,"eventUid":"00000000000000000000000000000008","type":"monitor_breach","groupId":"night-team","senderId":"server","senderName":"Server","message":"Low balance","monitorId":"balance","monitorName":"Balance","createdAt":98}]}"""
+                """{"serverInstanceId":"instance-primary","serverTime":99,"cursor":8,"headCursor":8,"cursorToken":"poll-token-8","cursorValid":true,"alerts":[{"id":8,"eventUid":"00000000000000000000000000000008","type":"monitor_breach","groupId":"night-team","senderId":"server","senderName":"Server","message":"Low balance","monitorId":"balance","monitorName":"Balance","createdAt":98}]}"""
             uri.path == "/api/v1/alerts" && request.method == "POST" ->
                 """{"accepted":true,"serverTime":99,"recipients":3,"onlineRecipients":1,"alert":{"id":9,"type":"manual","groupId":"night-team","senderId":"owner-phone","senderName":"Owner","message":"Please investigate","createdAt":99}}"""
             uri.path == "/api/v1/monitors" ->
@@ -258,11 +328,11 @@ class RelayApiTest {
         put("revision", revision)
         put("updatedAt", 99)
         put("name", "Balance")
-        put("url", "https://business.example/api?token=__KEEP__")
+        put("url", "https://user:password@business.example/api?token=real-token")
         put("method", "GET")
-        put("headersJson", "{\"Authorization\":\"__KEEP__\"}")
-        put("body", "__KEEP__")
-        put("urlMasked", true)
+        put("headersJson", "{\"Authorization\":\"Bearer real-secret\"}")
+        put("body", "{\"account\":\"secret\"}")
+        put("urlMasked", false)
         put("headersConfigured", true)
         put("bodyConfigured", true)
         put("jsonPath", "data.balance")

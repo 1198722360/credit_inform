@@ -13,9 +13,6 @@ services:
       MAX_POLL_SECONDS: "${MAX_POLL_SECONDS:-30}"
     volumes:
       - ./runtime/config:/app/config:ro
-      - relay-data:/app/data
+      - ./relay-data:/app/data
     security_opt:
       - no-new-privileges:true
-
-volumes:
-  relay-data:

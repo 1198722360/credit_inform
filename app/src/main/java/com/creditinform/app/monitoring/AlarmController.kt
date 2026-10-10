@@ -15,6 +15,7 @@ import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import com.creditinform.app.data.RelayRepository
+import com.creditinform.app.R
 import com.creditinform.app.ui.AlertActivity
 import kotlin.math.roundToInt
 
@@ -284,7 +285,7 @@ object AlarmController {
         )
 
         val notification = Notification.Builder(context, NotificationChannels.ALERT_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_error)
+            .setSmallIcon(R.drawable.ic_stat_relay)
             .setContentTitle(alarm.notificationTitle)
             .setContentText(alarm.notificationText)
             .setStyle(Notification.BigTextStyle().bigText(alarm.detail))

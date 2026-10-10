@@ -1,14 +1,15 @@
 package com.creditinform.app.data
 
+import com.creditinform.app.BuildConfig
 import java.util.UUID
 
 data class RelayConfig(
     val serverUrl: String = "",
-    val groupId: String = "",
+    val groupId: String = INTERNAL_GROUP_ID,
     val sharedToken: String = "",
     val adminToken: String = "",
     val deviceId: String = UUID.randomUUID().toString(),
-    val deviceName: String = "本机",
+    val deviceName: String = INTERNAL_DEVICE_NAME,
     val enabled: Boolean = false,
     val vibrateEnabled: Boolean = true,
     val soundEnabled: Boolean = true,
@@ -18,25 +19,27 @@ data class RelayConfig(
     val isComplete: Boolean
         get() = serverUrl.length in 1..MAX_URL_LENGTH &&
             (serverUrl.startsWith("https://") || serverUrl.startsWith("http://")) &&
-            isValidIdentifier(groupId) && sharedToken.isNotBlank() &&
-            isValidIdentifier(deviceId) && deviceName.length in 1..MAX_NAME_LENGTH
+            sharedToken.isNotBlank() && isValidIdentifier(deviceId)
 
     val hasAdminAccess: Boolean
         get() = (serverUrl.startsWith("https://") || serverUrl.startsWith("http://")) &&
             serverUrl.length <= MAX_URL_LENGTH &&
-            isValidIdentifier(groupId) && adminToken.isNotBlank()
+            adminToken.isNotBlank()
 
     fun normalized(): RelayConfig = copy(
         serverUrl = serverUrl.trim().trimEnd('/'),
-        groupId = groupId.trim(),
+        groupId = INTERNAL_GROUP_ID,
         sharedToken = sharedToken.trim(),
         adminToken = adminToken.trim(),
         deviceId = deviceId.trim().ifBlank { UUID.randomUUID().toString() },
-        deviceName = deviceName.trim().ifBlank { "本机" },
+        deviceName = INTERNAL_DEVICE_NAME,
         alarmVolumePercent = alarmVolumePercent.coerceIn(1, 100)
     )
 
     companion object {
+        const val DEFAULT_SERVER_URL = "http://15.204.246.22:8047"
+        const val INTERNAL_GROUP_ID = "customer-service"
+        const val INTERNAL_DEVICE_NAME = "Android 客户端"
         const val MAX_NAME_LENGTH = 128
         const val MAX_URL_LENGTH = 2048
         private val IDENTIFIER_PATTERN = Regex("^[A-Za-z0-9._-]{1,64}$")
@@ -44,6 +47,11 @@ data class RelayConfig(
         fun isValidIdentifier(value: String): Boolean = IDENTIFIER_PATTERN.matches(value)
 
         fun isValidGroupId(value: String): Boolean = isValidIdentifier(value)
+
+        fun freshInstall(): RelayConfig = RelayConfig(
+            serverUrl = DEFAULT_SERVER_URL,
+            sharedToken = BuildConfig.RELAY_DEFAULT_SHARED_TOKEN
+        )
     }
 }
 
@@ -95,7 +103,8 @@ data class RelayRegistration(
     val client: RelayClient,
     val onlineClients: Int = 0,
     val totalClients: Int = 0,
-    val serverInstanceId: String? = null
+    val serverInstanceId: String? = null,
+    val cursorToken: String? = null
 )
 
 enum class RelayAlertType(val wireValue: String) {
@@ -153,7 +162,9 @@ data class RelayPollResult(
     val cursor: Long,
     val headCursor: Long,
     val serverTime: Long,
-    val serverInstanceId: String? = null
+    val serverInstanceId: String? = null,
+    val cursorToken: String? = null,
+    val cursorValid: Boolean = true
 )
 
 data class RemoteMonitorConfigStatus(
@@ -166,6 +177,8 @@ data class RemoteMonitorStatus(
     val id: String,
     val name: String,
     val enabled: Boolean,
+    val url: String = "",
+    val method: String = "GET",
     val operator: String,
     val threshold: Double,
     val pollIntervalSeconds: Long,
@@ -260,4 +273,34 @@ data class RemoteMonitorTestResult(
     val rawValue: Double?,
     val value: Double?,
     val breached: Boolean
+)
+
+data class RemoteMonitorRefreshResult(
+    val ok: Boolean,
+    val serverTime: Long,
+    val total: Int,
+    val succeeded: Int,
+    val failed: Int,
+    val results: List<RemoteMonitorRefreshItemResult>
+)
+
+data class RemoteMonitorRefreshItemResult(
+    val monitorId: String,
+    val monitorName: String,
+    val ok: Boolean,
+    val result: RemoteMonitorRefreshCheckResult? = null,
+    val error: RemoteMonitorRefreshError? = null
+)
+
+data class RemoteMonitorRefreshCheckResult(
+    val httpCode: Int?,
+    val rawValue: Double?,
+    val value: Double?,
+    val breached: Boolean
+)
+
+data class RemoteMonitorRefreshError(
+    val code: String,
+    val message: String,
+    val httpCode: Int?
 )

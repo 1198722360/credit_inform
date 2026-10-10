@@ -14,6 +14,9 @@ internal fun decideRelayServerState(
     cursor: Long,
     serverCursor: Long,
     cursorInitialized: Boolean,
+    cursorTokenPresent: Boolean,
+    serverCursorTokenPresent: Boolean,
+    cursorValid: Boolean,
     initializeIfNeeded: Boolean,
     checkCursorRegression: Boolean
 ): RelayServerStateDecision {
@@ -22,7 +25,11 @@ internal fun decideRelayServerState(
     val instanceChanged = storedInstanceId != null && storedInstanceId != incomingInstanceId
     val cursorRegressed = cursorInitialized && checkCursorRegression &&
         serverCursor.coerceAtLeast(0) < cursor
-    val resetCursor = firstInstanceBinding || instanceChanged || cursorRegressed
+    val cursorTokenRejected = cursorInitialized && !cursorValid
+    val cursorTokenMigrationRequired = cursorInitialized && cursor > 0 &&
+        !cursorTokenPresent && serverCursorTokenPresent
+    val resetCursor = firstInstanceBinding || instanceChanged || cursorRegressed ||
+        cursorTokenRejected || cursorTokenMigrationRequired
     val initializeCursor = !cursorInitialized && initializeIfNeeded && !resetCursor
     val nextCursor = when {
         resetCursor -> 0L

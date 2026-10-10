@@ -1,7 +1,6 @@
 package com.creditinform.app.data
 
 import android.content.Context
-import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -29,6 +28,8 @@ class RelayRepository private constructor(context: Context) {
     )
     private val api = RelayApi()
     private val lock = Any()
+    private val connectionTransitionLock = Any()
+    private val remoteMonitorSnapshotGate = RemoteMonitorSnapshotGate()
 
     private val _config = MutableStateFlow(loadConfig())
     val config: StateFlow<RelayConfig> = _config.asStateFlow()
@@ -63,6 +64,11 @@ class RelayRepository private constructor(context: Context) {
     private val _cursor = MutableStateFlow(preferences.getLong(KEY_CURSOR, 0L))
     val cursor: StateFlow<Long> = _cursor.asStateFlow()
 
+    private val _cursorToken = MutableStateFlow(
+        preferences.getString(KEY_CURSOR_TOKEN, null).normalizedCursorToken()
+    )
+    val cursorToken: StateFlow<String?> = _cursorToken.asStateFlow()
+
     private val _currentServerInstanceId = MutableStateFlow(
         preferences.getString(KEY_SERVER_INSTANCE_ID, null).normalizedInstanceId()
     )
@@ -78,30 +84,33 @@ class RelayRepository private constructor(context: Context) {
         persistConfig(_config.value)
     }
 
-    fun saveConfig(value: RelayConfig) = synchronized(lock) {
-        val normalized = value.normalized()
-        val previous = _config.value
-        val identityChanged = !sameIdentity(previous, normalized)
-        val adminIdentityChanged = !sameAdminIdentity(previous, normalized)
+    fun saveConfig(value: RelayConfig) = synchronized(connectionTransitionLock) {
+        synchronized(lock) {
+            val normalized = value.normalized()
+            val previous = _config.value
+            val identityChanged = !sameIdentity(previous, normalized)
+            val adminIdentityChanged = !sameAdminIdentity(previous, normalized)
 
-        if (identityChanged) {
-            persistConfigAndResetIdentityLocked(normalized)
-            _monitorStatuses.value = emptyList()
-            _monitorConfigStatus.value = RemoteMonitorConfigStatus(false, 0, "")
-        } else {
-            persistConfig(normalized)
-        }
-        if (adminIdentityChanged) _remoteMonitorConfigs.value = emptyList()
-        // Publish only after identity-bound local state has been reset.
-        _config.value = normalized
-        _status.value = RelayStatus(
-            state = if (normalized.enabled) {
-                RelayConnectionState.OFFLINE
+            if (identityChanged) {
+                persistConfigAndResetIdentityLocked(normalized)
+                remoteMonitorSnapshotGate.reset()
+                _monitorStatuses.value = emptyList()
+                _monitorConfigStatus.value = RemoteMonitorConfigStatus(false, 0, "")
             } else {
-                RelayConnectionState.DISABLED
+                persistConfig(normalized)
             }
-        )
-        persistStatus(_status.value)
+            if (adminIdentityChanged) _remoteMonitorConfigs.value = emptyList()
+            // Publish only after identity-bound local state has been reset.
+            _config.value = normalized
+            _status.value = RelayStatus(
+                state = if (normalized.enabled) {
+                    RelayConnectionState.OFFLINE
+                } else {
+                    RelayConnectionState.DISABLED
+                }
+            )
+            persistStatus(_status.value)
+        }
     }
 
     fun setEnabled(enabled: Boolean) {
@@ -137,6 +146,8 @@ class RelayRepository private constructor(context: Context) {
                     candidate = current,
                     serverInstanceId = it.serverInstanceId,
                     serverCursor = it.cursor,
+                    serverCursorToken = it.cursorToken,
+                    cursorValid = true,
                     initializeIfNeeded = true,
                     checkCursorRegression = true
                 )
@@ -154,6 +165,8 @@ class RelayRepository private constructor(context: Context) {
                     candidate = current,
                     serverInstanceId = it.serverInstanceId,
                     serverCursor = it.cursor,
+                    serverCursorToken = it.cursorToken,
+                    cursorValid = true,
                     initializeIfNeeded = true,
                     checkCursorRegression = true
                 )
@@ -180,7 +193,15 @@ class RelayRepository private constructor(context: Context) {
             val current = config.value
             relayResult(current) {
                 validateRelayConfig(current)
-                val response = api.poll(current, cursor.value, waitSeconds)
+                val (after, afterToken) = synchronized(lock) {
+                    _cursor.value to _cursorToken.value
+                }
+                val response = api.poll(
+                    config = current,
+                    after = after,
+                    afterToken = afterToken,
+                    waitSeconds = waitSeconds
+                )
                 if (!sameRelayConnection(current, config.value)) {
                     throw CancellationException("通信配置已变更")
                 }
@@ -188,11 +209,22 @@ class RelayRepository private constructor(context: Context) {
                     candidate = current,
                     serverInstanceId = response.serverInstanceId,
                     serverCursor = response.headCursor,
+                    serverCursorToken = response.cursorToken,
+                    cursorValid = response.cursorValid,
                     initializeIfNeeded = false,
                     checkCursorRegression = true
                 )
                 recordOnlineIfCurrent(current)
-                if (reset) response.copy(events = emptyList(), cursor = 0L) else response
+                if (reset) {
+                    response.copy(
+                        events = emptyList(),
+                        cursor = 0L,
+                        cursorToken = null,
+                        cursorValid = false
+                    )
+                } else {
+                    response
+                }
             }
         }
 
@@ -201,61 +233,73 @@ class RelayRepository private constructor(context: Context) {
         candidate: RelayConfig,
         poll: RelayPollResult,
         process: (RelayAlarmEvent) -> Unit
-    ) =
-        synchronized(lock) {
-            if (!sameRelayConnection(candidate, config.value)) return@synchronized
-            val current = config.value
-            val currentInstanceId = _currentServerInstanceId.value
-            val responseInstanceId = poll.serverInstanceId.normalizedInstanceId()
-            if (responseInstanceId != currentInstanceId) {
-                return@synchronized
-            }
-            val existing = _pendingEvents.value
-                .mapTo(hashSetOf()) { it.groupId to it.acknowledgementKey }
-            val relevant = poll.events
-                .filter { it.groupId == current.groupId && it.senderId != current.deviceId }
-                .filter {
-                    val eventInstanceId = it.serverInstanceId.normalizedInstanceId()
-                    eventInstanceId == currentInstanceId
-                }
-                .distinctBy { it.groupId to it.acknowledgementKey }
-                .sortedBy { it.eventId }
-            val added = relevant.filter { (it.groupId to it.acknowledgementKey) !in existing }
-            val updated = (_pendingEvents.value + added)
-                .distinctBy { it.groupId to it.acknowledgementKey }
-                .sortedBy { it.eventId }
-            if (added.isNotEmpty()) {
-                persistPendingEvents(updated)
-                _pendingEvents.value = updated
-            }
-            val pendingKeys = updated.mapTo(hashSetOf()) { it.groupId to it.acknowledgementKey }
-            relevant
-                .filter { (it.groupId to it.acknowledgementKey) in pendingKeys }
-                .forEach(process)
+    ) = synchronized(connectionTransitionLock) {
+        val events = synchronized(lock) {
+            recordPendingEventsLocked(candidate, poll)
         }
+        events.forEach(process)
+    }
+
+    private fun recordPendingEventsLocked(
+        candidate: RelayConfig,
+        poll: RelayPollResult
+    ): List<RelayAlarmEvent> {
+        if (!sameRelayConnection(candidate, config.value)) return emptyList()
+        val currentInstanceId = _currentServerInstanceId.value
+        val responseInstanceId = poll.serverInstanceId.normalizedInstanceId()
+        if (responseInstanceId != currentInstanceId) return emptyList()
+        val existing = _pendingEvents.value
+            .mapTo(hashSetOf()) { it.groupId to it.acknowledgementKey }
+        val relevant = poll.events
+            .filter { it.senderId != candidate.deviceId }
+            .filter {
+                val eventInstanceId = it.serverInstanceId.normalizedInstanceId()
+                eventInstanceId == currentInstanceId
+            }
+            .distinctBy { it.groupId to it.acknowledgementKey }
+            .sortedBy { it.eventId }
+        val added = relevant.filter { (it.groupId to it.acknowledgementKey) !in existing }
+        val updated = (_pendingEvents.value + added)
+            .distinctBy { it.groupId to it.acknowledgementKey }
+            .sortedBy { it.eventId }
+        if (added.isNotEmpty()) {
+            persistPendingEvents(updated)
+            _pendingEvents.value = updated
+        }
+        val pendingKeys = updated.mapTo(hashSetOf()) { it.groupId to it.acknowledgementKey }
+        return relevant.filter { (it.groupId to it.acknowledgementKey) in pendingKeys }
+    }
 
     fun acknowledgeThrough(candidate: RelayConfig, poll: RelayPollResult) {
         synchronized(lock) {
             if (!sameRelayConnection(candidate, config.value)) return@synchronized
+            if (!poll.cursorValid) return@synchronized
             val responseInstanceId = poll.serverInstanceId.normalizedInstanceId()
             if (responseInstanceId != _currentServerInstanceId.value) {
                 return@synchronized
             }
-            if (poll.cursor <= _cursor.value) return@synchronized
-            check(
-                preferences.edit()
-                    .putLong(KEY_CURSOR, poll.cursor)
-                    .putBoolean(KEY_CURSOR_INITIALIZED, true)
-                    .commit()
-            ) { "无法保存报警游标" }
+            if (poll.cursor < _cursor.value) return@synchronized
+            val responseCursorToken = poll.cursorToken.normalizedCursorToken()
+            if (poll.cursor == _cursor.value && responseCursorToken == _cursorToken.value) {
+                return@synchronized
+            }
+            val editor = preferences.edit()
+                .putLong(KEY_CURSOR, poll.cursor)
+                .putBoolean(KEY_CURSOR_INITIALIZED, true)
+            if (responseCursorToken != null) {
+                editor.putString(KEY_CURSOR_TOKEN, responseCursorToken)
+            } else {
+                editor.remove(KEY_CURSOR_TOKEN)
+            }
+            check(editor.commit()) { "无法保存报警游标和令牌" }
             _cursor.value = poll.cursor
+            _cursorToken.value = responseCursorToken
         }
     }
 
     fun acknowledgeLocally(acknowledgementKey: String) = synchronized(lock) {
-        val currentGroupId = config.value.groupId
         val updated = _pendingEvents.value.filterNot { event ->
-            event.groupId == currentGroupId && event.matchesAcknowledgementKey(acknowledgementKey)
+            event.matchesAcknowledgementKey(acknowledgementKey)
         }
         if (updated.size == _pendingEvents.value.size) return@synchronized
         persistPendingEvents(updated)
@@ -335,6 +379,64 @@ class RelayRepository private constructor(context: Context) {
             }
         }
     }
+
+    suspend fun copyRemoteMonitor(
+        monitorId: String
+    ): Result<RemoteMonitorMutationResult> = withContext(Dispatchers.IO) {
+        adminResult {
+            val id = monitorId.trim()
+            require(RelayConfig.isValidIdentifier(id)) { "监控 ID 无效" }
+            val current = config.value
+            validateAdminConfig(current)
+            api.copyMonitor(current, id).also { result ->
+                if (sameAdminIdentity(current, config.value)) {
+                    val updated = _remoteMonitorConfigs.value.toMutableList()
+                    val sourceIndex = updated.indexOfFirst { monitor -> monitor.id == id }
+                    val insertAt = if (sourceIndex >= 0) sourceIndex + 1 else updated.size
+                    updated.add(insertAt, result.monitor)
+                    _remoteMonitorConfigs.value = updated
+                }
+            }
+        }
+    }
+
+    suspend fun reorderRemoteMonitors(
+        expectedMonitorIds: List<String>,
+        monitorIds: List<String>
+    ): Result<RemoteMonitorConfigsResult> = withContext(Dispatchers.IO) {
+        adminResult {
+            require(expectedMonitorIds.size == expectedMonitorIds.distinct().size) {
+                "原监控顺序包含重复 ID"
+            }
+            require(monitorIds.size == monitorIds.distinct().size) { "新监控顺序包含重复 ID" }
+            require(expectedMonitorIds.toSet() == monitorIds.toSet()) { "排序前后监控 ID 不一致" }
+            val current = config.value
+            validateAdminConfig(current)
+            api.reorderMonitors(current, expectedMonitorIds, monitorIds).also { result ->
+                if (sameAdminIdentity(current, config.value)) {
+                    _remoteMonitorConfigs.value = result.monitors
+                }
+            }
+        }
+    }
+
+    suspend fun refreshRemoteMonitorValues(): Result<RemoteMonitorRefreshResult> =
+        withContext(Dispatchers.IO) {
+            adminResult {
+                val current = config.value
+                validateAdminConfig(current)
+                validateRelayConfig(current, requireEnabled = false)
+                refreshRemoteMonitorValuesAndPublish(api, current) { latest ->
+                    recordRemoteMonitorsIfCurrent(
+                        candidate = current,
+                        result = latest,
+                        requireAdminIdentity = true
+                    )
+                }.also {
+                    recordOnlineIfCurrent(current)
+                }
+            }
+        }
 
     suspend fun testRemoteMonitor(
         monitorId: String
@@ -417,6 +519,8 @@ class RelayRepository private constructor(context: Context) {
         candidate: RelayConfig,
         serverInstanceId: String?,
         serverCursor: Long,
+        serverCursorToken: String?,
+        cursorValid: Boolean,
         initializeIfNeeded: Boolean,
         checkCursorRegression: Boolean
     ): Boolean = synchronized(lock) {
@@ -425,6 +529,7 @@ class RelayRepository private constructor(context: Context) {
         }
 
         val incomingInstanceId = serverInstanceId.normalizedInstanceId()
+        val incomingCursorToken = serverCursorToken.normalizedCursorToken()
         val storedInstanceId = _currentServerInstanceId.value
         val initialized = preferences.getBoolean(KEY_CURSOR_INITIALIZED, false)
         val decision = decideRelayServerState(
@@ -433,14 +538,28 @@ class RelayRepository private constructor(context: Context) {
             cursor = _cursor.value,
             serverCursor = serverCursor,
             cursorInitialized = initialized,
+            cursorTokenPresent = _cursorToken.value != null,
+            serverCursorTokenPresent = incomingCursorToken != null,
+            cursorValid = cursorValid,
             initializeIfNeeded = initializeIfNeeded,
             checkCursorRegression = checkCursorRegression
         )
         if (!decision.changed) return@synchronized false
 
+        val initializingCursor = !initialized && initializeIfNeeded && !decision.resetCursor
+        val nextCursorToken = when {
+            decision.resetCursor -> null
+            initializingCursor -> incomingCursorToken
+            else -> _cursorToken.value
+        }
         val editor = preferences.edit()
             .putLong(KEY_CURSOR, decision.cursor)
             .putBoolean(KEY_CURSOR_INITIALIZED, decision.cursorInitialized)
+        if (nextCursorToken != null) {
+            editor.putString(KEY_CURSOR_TOKEN, nextCursorToken)
+        } else {
+            editor.remove(KEY_CURSOR_TOKEN)
+        }
         if (decision.serverInstanceId != null) {
             editor.putString(KEY_SERVER_INSTANCE_ID, decision.serverInstanceId)
         } else {
@@ -448,17 +567,25 @@ class RelayRepository private constructor(context: Context) {
         }
         check(editor.commit()) { "无法保存服务端实例和报警游标" }
         _cursor.value = decision.cursor
+        _cursorToken.value = nextCursorToken
         _currentServerInstanceId.value = decision.serverInstanceId
         decision.resetCursor
     }
 
     private fun recordRemoteMonitorsIfCurrent(
         candidate: RelayConfig,
-        result: RemoteMonitorsResult
-    ) = synchronized(lock) {
-        if (!sameIdentity(candidate, config.value)) return@synchronized
-        _monitorStatuses.value = result.monitors
-        _monitorConfigStatus.value = result.config
+        result: RemoteMonitorsResult,
+        requireAdminIdentity: Boolean = false
+    ): RemoteMonitorSnapshotPublication = synchronized(lock) {
+        remoteMonitorSnapshotGate.publish(
+            serverTime = result.serverTime,
+            relayIdentityMatches = sameIdentity(candidate, config.value),
+            adminIdentityMatches = sameAdminIdentity(candidate, config.value),
+            requireAdminIdentity = requireAdminIdentity
+        ) {
+            _monitorStatuses.value = result.monitors
+            _monitorConfigStatus.value = result.config
+        }
     }
 
     private fun upsertRemoteMonitorIfCurrent(candidate: RelayConfig, monitor: RemoteMonitorConfig) {
@@ -472,23 +599,14 @@ class RelayRepository private constructor(context: Context) {
     private fun validateRelayConfig(value: RelayConfig, requireEnabled: Boolean = true) {
         if (requireEnabled) require(value.enabled) { "通信功能未启用" }
         validateServerUrl(value.serverUrl)
-        require(RelayConfig.isValidIdentifier(value.groupId)) {
-            "通信组必须为 1 到 64 位字母、数字、点、下划线或短横线"
-        }
         require(value.sharedToken.isNotBlank()) { "共享密钥不能为空" }
         require(RelayConfig.isValidIdentifier(value.deviceId)) {
             "客户端 ID 必须为 1 到 64 位字母、数字、点、下划线或短横线"
-        }
-        require(value.deviceName.length in 1..RelayConfig.MAX_NAME_LENGTH) {
-            "客户端名称必须为 1 到 ${RelayConfig.MAX_NAME_LENGTH} 个字符"
         }
     }
 
     private fun validateAdminConfig(value: RelayConfig) {
         validateServerUrl(value.serverUrl)
-        require(RelayConfig.isValidIdentifier(value.groupId)) {
-            "通信组必须为 1 到 64 位字母、数字、点、下划线或短横线"
-        }
         require(value.adminToken.isNotBlank()) { "管理员密钥不能为空" }
     }
 
@@ -536,7 +654,6 @@ class RelayRepository private constructor(context: Context) {
 
     private fun sameIdentity(first: RelayConfig, second: RelayConfig): Boolean =
         first.serverUrl == second.serverUrl &&
-            first.groupId == second.groupId &&
             first.deviceId == second.deviceId &&
             first.sharedToken == second.sharedToken
 
@@ -545,46 +662,44 @@ class RelayRepository private constructor(context: Context) {
 
     private fun sameAdminIdentity(first: RelayConfig, second: RelayConfig): Boolean =
         first.serverUrl == second.serverUrl &&
-            first.groupId == second.groupId &&
             first.adminToken == second.adminToken
 
-    private fun loadConfig(): RelayConfig = runCatching {
-        val json = JSONObject(preferences.getString(KEY_CONFIG, "{}") ?: "{}")
-        val encryptedSharedToken = json.optString("encryptedSharedToken")
-            .ifBlank { json.optString("encryptedToken") }
-        val encryptedAdminToken = json.optString("encryptedAdminToken")
-        RelayConfig(
-            serverUrl = json.optString("serverUrl"),
-            groupId = json.optString("groupId").ifBlank { json.optString("channelId") },
-            sharedToken = decryptSecret(encryptedSharedToken).ifBlank {
-                json.optString("sharedToken").ifBlank { json.optString("authToken") }
-            },
-            adminToken = decryptSecret(encryptedAdminToken).ifBlank {
-                json.optString("adminToken")
-            },
-            deviceId = json.optString("deviceId").ifBlank { UUID.randomUUID().toString() },
-            deviceName = json.optString("deviceName", defaultDeviceName()),
-            enabled = json.optBoolean("enabled", false),
-            vibrateEnabled = json.optBoolean("vibrateEnabled", true),
-            soundEnabled = json.optBoolean("soundEnabled", true),
-            alarmVolumePercent = json.optInt("alarmVolumePercent", 100),
-            ringtoneUri = json.optString("ringtoneUri")
-        ).normalized()
-    }.getOrElse { RelayConfig(deviceName = defaultDeviceName()) }
+    private fun loadConfig(): RelayConfig {
+        if (!preferences.contains(KEY_CONFIG)) return RelayConfig.freshInstall()
+        return runCatching {
+            val json = JSONObject(preferences.getString(KEY_CONFIG, "{}") ?: "{}")
+            val encryptedSharedToken = json.optString("encryptedSharedToken")
+                .ifBlank { json.optString("encryptedToken") }
+            val encryptedAdminToken = json.optString("encryptedAdminToken")
+            RelayConfig(
+                serverUrl = json.optString("serverUrl"),
+                sharedToken = decryptSecret(encryptedSharedToken).ifBlank {
+                    json.optString("sharedToken").ifBlank { json.optString("authToken") }
+                },
+                adminToken = decryptSecret(encryptedAdminToken).ifBlank {
+                    json.optString("adminToken")
+                },
+                deviceId = json.optString("deviceId").ifBlank { UUID.randomUUID().toString() },
+                enabled = json.optBoolean("enabled", false),
+                vibrateEnabled = json.optBoolean("vibrateEnabled", true),
+                soundEnabled = json.optBoolean("soundEnabled", true),
+                alarmVolumePercent = json.optInt("alarmVolumePercent", 100),
+                ringtoneUri = json.optString("ringtoneUri")
+            ).normalized()
+        }.getOrElse { RelayConfig() }
+    }
 
     private fun configJson(value: RelayConfig): JSONObject = JSONObject().apply {
-            put("serverUrl", value.serverUrl)
-            put("groupId", value.groupId)
-            put("encryptedSharedToken", encryptSecret(value.sharedToken))
-            put("encryptedAdminToken", encryptSecret(value.adminToken))
-            put("deviceId", value.deviceId)
-            put("deviceName", value.deviceName)
-            put("enabled", value.enabled)
-            put("vibrateEnabled", value.vibrateEnabled)
-            put("soundEnabled", value.soundEnabled)
-            put("alarmVolumePercent", value.alarmVolumePercent)
-            put("ringtoneUri", value.ringtoneUri)
-        }
+        put("serverUrl", value.serverUrl)
+        put("encryptedSharedToken", encryptSecret(value.sharedToken))
+        put("encryptedAdminToken", encryptSecret(value.adminToken))
+        put("deviceId", value.deviceId)
+        put("enabled", value.enabled)
+        put("vibrateEnabled", value.vibrateEnabled)
+        put("soundEnabled", value.soundEnabled)
+        put("alarmVolumePercent", value.alarmVolumePercent)
+        put("ringtoneUri", value.ringtoneUri)
+    }
 
     private fun persistConfig(value: RelayConfig) {
         check(preferences.edit().putString(KEY_CONFIG, configJson(value).toString()).commit()) {
@@ -599,11 +714,13 @@ class RelayRepository private constructor(context: Context) {
                 .putString(KEY_PENDING_EVENTS, "[]")
                 .putLong(KEY_CURSOR, 0L)
                 .putBoolean(KEY_CURSOR_INITIALIZED, false)
+                .remove(KEY_CURSOR_TOKEN)
                 .remove(KEY_SERVER_INSTANCE_ID)
                 .commit()
         ) { "无法保存通信配置并重置报警状态" }
         _pendingEvents.value = emptyList()
         _cursor.value = 0L
+        _cursorToken.value = null
         _currentServerInstanceId.value = null
     }
 
@@ -724,16 +841,11 @@ class RelayRepository private constructor(context: Context) {
         }
     }
 
-    private fun defaultDeviceName(): String =
-        listOf(Build.MANUFACTURER, Build.MODEL)
-            .map(String::trim)
-            .filter(String::isNotBlank)
-            .distinct()
-            .joinToString(" ")
-            .ifBlank { "Android 客户端" }
-
     private fun String?.normalizedInstanceId(): String? =
         this?.trim()?.takeIf { it.isNotEmpty() }
+
+    private fun String?.normalizedCursorToken(): String? =
+        this?.takeIf { it.isNotBlank() }
 
     companion object {
         private const val PREFS_NAME = "credit_inform_relay"
@@ -742,6 +854,7 @@ class RelayRepository private constructor(context: Context) {
         private const val KEY_PENDING_EVENTS = "pending_events_v2"
         private const val KEY_CURSOR = "event_cursor_v2"
         private const val KEY_CURSOR_INITIALIZED = "event_cursor_initialized_v2"
+        private const val KEY_CURSOR_TOKEN = "event_cursor_token_v2"
         private const val KEY_SERVER_INSTANCE_ID = "server_instance_id_v2"
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
         private const val KEY_ALIAS = "credit_inform_relay_token"

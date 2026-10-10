@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import com.creditinform.app.MainActivity
+import com.creditinform.app.R
 import com.creditinform.app.data.RelayAlarmEvent
 import com.creditinform.app.data.RelayAlertType
 import com.creditinform.app.data.RelayConfig
@@ -111,6 +112,10 @@ class RelayService : Service() {
             val result = repository.pollOnce(POLL_SECONDS)
             result.onSuccess { poll ->
                 try {
+                    if (!poll.cursorValid) {
+                        consecutiveFailures = 0
+                        return@onSuccess
+                    }
                     // Persist first. A process killed after this point will replay pending events.
                     repository.processPendingEvents(config, poll) { triggerEvent(config, it) }
                     // Advance only after every relevant event is durably stored and sounded.
@@ -165,7 +170,7 @@ class RelayService : Service() {
 
     private fun replayPendingEvents(config: RelayConfig) {
         repository.pendingEvents.value
-            .filter { it.groupId == config.groupId && it.senderId != config.deviceId }
+            .filter { it.senderId != config.deviceId }
             .forEach { triggerEvent(config, it) }
     }
 
@@ -285,7 +290,7 @@ class RelayService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         return Notification.Builder(this, NotificationChannels.SERVICE_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setSmallIcon(R.drawable.ic_stat_relay)
             .setContentTitle("值守报警正在运行")
             .setContentText(detail.take(120))
             .setOngoing(true)

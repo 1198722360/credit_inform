@@ -22,11 +22,11 @@ class RelayProtocolTest {
         ).normalized()
 
         assertEquals("https://alarm.example.com", config.serverUrl)
-        assertEquals("night-ops", config.groupId)
+        assertEquals(RelayConfig.INTERNAL_GROUP_ID, config.groupId)
         assertEquals("secret", config.sharedToken)
         assertEquals("admin-secret", config.adminToken)
         assertEquals("owner-phone", config.deviceId)
-        assertEquals("owner", config.deviceName)
+        assertEquals(RelayConfig.INTERNAL_DEVICE_NAME, config.deviceName)
         assertEquals(1, config.alarmVolumePercent)
         assertTrue(config.isComplete)
     }

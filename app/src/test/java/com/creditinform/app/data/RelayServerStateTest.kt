@@ -14,6 +14,9 @@ class RelayServerStateTest {
             cursor = 0,
             serverCursor = 12,
             cursorInitialized = false,
+            cursorTokenPresent = false,
+            serverCursorTokenPresent = true,
+            cursorValid = true,
             initializeIfNeeded = true,
             checkCursorRegression = true
         )
@@ -33,6 +36,9 @@ class RelayServerStateTest {
             cursor = 10,
             serverCursor = 15,
             cursorInitialized = true,
+            cursorTokenPresent = true,
+            serverCursorTokenPresent = true,
+            cursorValid = true,
             initializeIfNeeded = true,
             checkCursorRegression = true
         )
@@ -42,6 +48,9 @@ class RelayServerStateTest {
             cursor = 10,
             serverCursor = 3,
             cursorInitialized = true,
+            cursorTokenPresent = true,
+            serverCursorTokenPresent = true,
+            cursorValid = true,
             initializeIfNeeded = true,
             checkCursorRegression = true
         )
@@ -60,6 +69,9 @@ class RelayServerStateTest {
             cursor = 20,
             serverCursor = 8,
             cursorInitialized = true,
+            cursorTokenPresent = true,
+            serverCursorTokenPresent = true,
+            cursorValid = true,
             initializeIfNeeded = true,
             checkCursorRegression = true
         )
@@ -69,6 +81,9 @@ class RelayServerStateTest {
             cursor = 20,
             serverCursor = 20,
             cursorInitialized = true,
+            cursorTokenPresent = true,
+            serverCursorTokenPresent = false,
+            cursorValid = true,
             initializeIfNeeded = false,
             checkCursorRegression = true
         )
@@ -79,5 +94,68 @@ class RelayServerStateTest {
         assertTrue(downgrade.resetCursor)
         assertEquals(0L, downgrade.cursor)
         assertEquals(null, downgrade.serverInstanceId)
+    }
+
+    @Test
+    fun `invalid cursor token resets even when server cursor has not regressed`() {
+        val decision = decideRelayServerState(
+            storedInstanceId = "instance-a",
+            incomingInstanceId = "instance-a",
+            cursor = 20,
+            serverCursor = 20,
+            cursorInitialized = true,
+            cursorTokenPresent = true,
+            serverCursorTokenPresent = true,
+            cursorValid = false,
+            initializeIfNeeded = false,
+            checkCursorRegression = true
+        )
+
+        assertTrue(decision.changed)
+        assertTrue(decision.resetCursor)
+        assertEquals(0L, decision.cursor)
+        assertTrue(decision.cursorInitialized)
+    }
+
+    @Test
+    fun `legacy initialized cursor resets when server advertises cursor tokens`() {
+        val decision = decideRelayServerState(
+            storedInstanceId = "instance-a",
+            incomingInstanceId = "instance-a",
+            cursor = 20,
+            serverCursor = 20,
+            cursorInitialized = true,
+            cursorTokenPresent = false,
+            serverCursorTokenPresent = true,
+            cursorValid = true,
+            initializeIfNeeded = true,
+            checkCursorRegression = true
+        )
+
+        assertTrue(decision.changed)
+        assertTrue(decision.resetCursor)
+        assertEquals(0L, decision.cursor)
+        assertTrue(decision.cursorInitialized)
+    }
+
+    @Test
+    fun `legacy initialized cursor stays compatible with a tokenless server`() {
+        val decision = decideRelayServerState(
+            storedInstanceId = "instance-a",
+            incomingInstanceId = "instance-a",
+            cursor = 20,
+            serverCursor = 20,
+            cursorInitialized = true,
+            cursorTokenPresent = false,
+            serverCursorTokenPresent = false,
+            cursorValid = true,
+            initializeIfNeeded = true,
+            checkCursorRegression = true
+        )
+
+        assertFalse(decision.changed)
+        assertFalse(decision.resetCursor)
+        assertEquals(20L, decision.cursor)
+        assertTrue(decision.cursorInitialized)
     }
 }

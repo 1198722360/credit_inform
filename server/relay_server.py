@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from copy import deepcopy
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -25,11 +26,12 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "1.2.0"
+VERSION = "1.4.2"
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 KEEP_PLACEHOLDER = "__KEEP__"
+STORAGE_PROBE_INTERVAL_SECONDS = 15.0
 
 
 def now_ms() -> int:
@@ -76,9 +78,18 @@ def atomic_write_json(path: Path, document: Any) -> None:
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary_name, path)
+        fsync_directory(path.parent)
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def parse_headers_document(item: dict[str, Any], prefix: str) -> dict[str, str]:
@@ -183,7 +194,14 @@ class RelayState:
         self._clients: dict[tuple[str, str], dict[str, Any]] = {}
         self._events: dict[str, list[dict[str, Any]]] = {}
         self._next_event_id = 1
+        self._head_event_uid: str | None = None
         self._server_instance_id = uuid.uuid4().hex
+        self._last_storage_error = ""
+        self._last_storage_probe_error = ""
+        self._last_persisted_at = 0
+        self._storage_probe_lock = threading.Lock()
+        self._storage_probe_in_flight = False
+        self._last_storage_probe_at = float("-inf")
         self._load()
         # Write the identity before clients connect, including for a new or legacy state file.
         self._persist_locked()
@@ -236,6 +254,25 @@ class RelayState:
                 raise ValueError("nextEventId must be a positive integer")
             if isinstance(configured_next, int):
                 self._next_event_id = max(self._next_event_id, configured_next)
+            configured_head_uid = document.get("headEventUid")
+            if configured_head_uid is not None and (
+                not isinstance(configured_head_uid, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", configured_head_uid)
+            ):
+                raise ValueError("headEventUid must be a 32-character lowercase hex string")
+            if self._next_event_id > 1:
+                self._head_event_uid = configured_head_uid
+                if self._head_event_uid is None:
+                    head_id = self._next_event_id - 1
+                    self._head_event_uid = next(
+                        (
+                            event["eventUid"]
+                            for group_events in self._events.values()
+                            for event in group_events
+                            if event["id"] == head_id
+                        ),
+                        uuid.uuid4().hex,
+                    )
             configured_instance_id = document.get("serverInstanceId")
             if isinstance(configured_instance_id, str) and re.fullmatch(
                 r"[0-9a-f]{32}", configured_instance_id
@@ -248,28 +285,92 @@ class RelayState:
     def _persist_locked(self) -> None:
         if self.data_file is None:
             return
-        self.data_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "serverInstanceId": self._server_instance_id,
             "nextEventId": self._next_event_id,
+            "headEventUid": self._head_event_uid,
             "events": [
                 event
                 for group_events in self._events.values()
                 for event in group_events
             ],
         }
-        fd, temporary_name = tempfile.mkstemp(
-            prefix=f".{self.data_file.name}.", dir=str(self.data_file.parent)
-        )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as output:
-                json.dump(payload, output, ensure_ascii=False, separators=(",", ":"))
+            atomic_write_json(self.data_file, payload)
+        except Exception as error:
+            self._last_storage_error = (
+                f"relay event storage write failed ({type(error).__name__})"
+            )
+            raise
+        else:
+            self._last_storage_error = ""
+            self._last_storage_probe_error = ""
+            self._last_persisted_at = now_ms()
+
+    @staticmethod
+    def _perform_storage_probe(data_file: Path) -> None:
+        temporary_name = ""
+        try:
+            data_file.parent.mkdir(parents=True, exist_ok=True)
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".relay-storage-probe.", dir=str(data_file.parent)
+            )
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(b"ok")
                 output.flush()
                 os.fsync(output.fileno())
-            os.replace(temporary_name, self.data_file)
+            os.unlink(temporary_name)
+            temporary_name = ""
+            fsync_directory(data_file.parent)
         finally:
-            if os.path.exists(temporary_name):
+            if temporary_name and os.path.exists(temporary_name):
                 os.unlink(temporary_name)
+
+    def _maybe_probe_storage(self) -> None:
+        with self._condition:
+            data_file = self.data_file
+            persist_error = self._last_storage_error
+        if data_file is None or persist_error:
+            return
+
+        monotonic_now = time.monotonic()
+        with self._storage_probe_lock:
+            if self._storage_probe_in_flight or (
+                monotonic_now - self._last_storage_probe_at
+                < STORAGE_PROBE_INTERVAL_SECONDS
+            ):
+                return
+            self._storage_probe_in_flight = True
+
+        probe_error = ""
+        try:
+            try:
+                self._perform_storage_probe(data_file)
+            except Exception as error:
+                probe_error = (
+                    f"relay event storage probe failed ({type(error).__name__})"
+                )
+            with self._condition:
+                self._last_storage_probe_error = probe_error
+        finally:
+            with self._storage_probe_lock:
+                self._last_storage_probe_at = time.monotonic()
+                self._storage_probe_in_flight = False
+
+    def storage_status(self, probe: bool = False) -> dict[str, Any]:
+        if probe:
+            self._maybe_probe_storage()
+        with self._condition:
+            enabled = self.data_file is not None
+            error = self._last_storage_error or self._last_storage_probe_error
+            if not enabled:
+                error = "relay event persistence is disabled"
+            return {
+                "enabled": enabled,
+                "healthy": enabled and not error,
+                "lastPersistedAt": self._last_persisted_at,
+                "lastError": error,
+            }
 
     @property
     def server_instance_id(self) -> str:
@@ -319,6 +420,47 @@ class RelayState:
         with self._condition:
             return self._current_cursor_locked(group_id)
 
+    def _cursor_token_locked(self, cursor: int) -> str | None:
+        if cursor <= 0:
+            return None
+        if cursor == self._next_event_id - 1:
+            return self._head_event_uid
+        return next(
+            (
+                event["eventUid"]
+                for group_events in self._events.values()
+                for event in group_events
+                if event["id"] == cursor
+            ),
+            None,
+        )
+
+    def cursor_token(self, cursor: int) -> str | None:
+        with self._condition:
+            return self._cursor_token_locked(cursor)
+
+    def cursor_state(self, cursor: int | None = None) -> tuple[int, str | None, str | None]:
+        with self._condition:
+            head_cursor = self._current_cursor_locked("")
+            target_cursor = head_cursor if cursor is None else cursor
+            return (
+                head_cursor,
+                self._head_event_uid,
+                self._cursor_token_locked(target_cursor),
+            )
+
+    def _cursor_is_valid_locked(self, cursor: int, supplied_token: str | None) -> bool:
+        if supplied_token is None:
+            return True
+        expected_token = self._cursor_token_locked(cursor)
+        return expected_token is not None and hmac.compare_digest(
+            supplied_token, expected_token
+        )
+
+    def cursor_is_valid(self, cursor: int, supplied_token: str | None) -> bool:
+        with self._condition:
+            return self._cursor_is_valid_locked(cursor, supplied_token)
+
     @staticmethod
     def _public_event(event: dict[str, Any]) -> dict[str, Any]:
         return {key: value for key, value in event.items() if not key.startswith("_")}
@@ -341,6 +483,7 @@ class RelayState:
                 for existing_group, group_events in self._events.items()
             }
             previous_next_event_id = self._next_event_id
+            previous_head_event_uid = self._head_event_uid
             try:
                 timestamp = now_ms()
                 self._cleanup_events_locked(timestamp)
@@ -358,6 +501,7 @@ class RelayState:
                     "_excludedClientId": excluded_client_id,
                 }
                 self._next_event_id += 1
+                self._head_event_uid = event["eventUid"]
                 self._events.setdefault(group_id, []).append(event)
                 if len(self._events[group_id]) > self.max_events_per_group:
                     self._events[group_id] = self._events[group_id][-self.max_events_per_group :]
@@ -365,6 +509,7 @@ class RelayState:
             except Exception:
                 self._events = previous_events
                 self._next_event_id = previous_next_event_id
+                self._head_event_uid = previous_head_event_uid
                 raise
 
             total, online = self._recipient_counts_locked(group_id, excluded_client_id, timestamp)
@@ -399,6 +544,31 @@ class RelayState:
                     break
         return result, cursor
 
+    def _touch_poll_client_locked(self, group_id: str, client_id: str) -> None:
+        existing = self._clients.get((group_id, client_id))
+        client_name = existing["name"] if existing else client_id
+        self._touch_client_locked(group_id, client_id, client_name)
+
+    def _poll_locked(
+        self,
+        group_id: str,
+        client_id: str,
+        after: int,
+        deadline: float,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        while True:
+            if self._cleanup_events_locked(now_ms()):
+                self._persist_locked()
+            events, cursor = self._collect_locked(group_id, client_id, after, limit)
+            if events or cursor > after:
+                return events, cursor
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return [], cursor
+            self._condition.wait(remaining)
+            self._touch_poll_client_locked(group_id, client_id)
+
     def poll(
         self,
         group_id: str,
@@ -409,22 +579,35 @@ class RelayState:
     ) -> tuple[list[dict[str, Any]], int]:
         deadline = time.monotonic() + wait_seconds
         with self._condition:
-            existing = self._clients.get((group_id, client_id))
-            client_name = existing["name"] if existing else client_id
-            self._touch_client_locked(group_id, client_id, client_name)
-            while True:
-                if self._cleanup_events_locked(now_ms()):
-                    self._persist_locked()
-                events, cursor = self._collect_locked(group_id, client_id, after, limit)
-                if events or cursor > after:
-                    return events, cursor
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return [], cursor
-                self._condition.wait(remaining)
-                existing = self._clients.get((group_id, client_id))
-                client_name = existing["name"] if existing else client_id
-                self._touch_client_locked(group_id, client_id, client_name)
+            self._touch_poll_client_locked(group_id, client_id)
+            return self._poll_locked(group_id, client_id, after, deadline, limit)
+
+    def poll_with_cursor_token(
+        self,
+        group_id: str,
+        client_id: str,
+        after: int,
+        after_token: str | None,
+        wait_seconds: float,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, Any]], int, str | None, bool, int, str | None]:
+        deadline = time.monotonic() + wait_seconds
+        with self._condition:
+            self._touch_poll_client_locked(group_id, client_id)
+            head_cursor = self._current_cursor_locked(group_id)
+            if not self._cursor_is_valid_locked(after, after_token):
+                return [], 0, None, False, head_cursor, self._head_event_uid
+            events, cursor = self._poll_locked(
+                group_id, client_id, after, deadline, limit
+            )
+            return (
+                events,
+                cursor,
+                self._cursor_token_locked(cursor),
+                True,
+                self._current_cursor_locked(group_id),
+                self._head_event_uid,
+            )
 
     def client_counts(self, group_id: str | None = None) -> dict[str, int]:
         with self._condition:
@@ -476,6 +659,8 @@ class MonitorStatus:
     last_error: str = ""
     breached: bool = False
     consecutive_errors: int = 0
+    alert_breached: bool = False
+    alert_consecutive_errors: int = 0
     last_alert_at: int = 0
     next_check_at: int = field(default_factory=now_ms)
 
@@ -674,10 +859,13 @@ class MonitorManager:
         self._group_tokens: dict[str, str] = {}
         self._raw_monitors: dict[tuple[str, str], dict[str, Any]] = {}
         self._in_flight: set[tuple[str, str]] = set()
+        self._refresh_lock = threading.Lock()
         self._loaded = False
         self._last_loaded_at = 0
         self._last_error = ""
         self._last_signature: tuple[int | None, int | None] | None = None
+        self._scheduler_error = ""
+        self._scheduler_last_tick_at = 0
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -701,6 +889,8 @@ class MonitorManager:
 
     @staticmethod
     def _with_metadata(item: dict[str, Any], timestamp: int) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            raise ValueError("every monitor must be an object")
         result = dict(item)
         revision = result.get("revision", 1)
         updated_at = result.get("updatedAt", timestamp)
@@ -757,8 +947,10 @@ class MonitorManager:
                 if stat.st_size > MAX_RESPONSE_BYTES:
                     raise ValueError("configuration file is too large")
                 document = json.loads(self.config_file.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                raise ValueError("configuration root must be a JSON object")
             timestamp = now_ms()
-            base_monitors = document.get("monitors", []) if isinstance(document, dict) else []
+            base_monitors = document.get("monitors", [])
             raw_monitors: list[dict[str, Any]]
             if self.managed_store_file is not None:
                 if self.managed_store_file.exists():
@@ -786,6 +978,11 @@ class MonitorManager:
             runtime_document = dict(document)
             runtime_document["monitors"] = raw_monitors
             group_tokens, definitions = parse_runtime_config(runtime_document)
+            if not self.global_token and not group_tokens:
+                raise ValueError(
+                    "no shared token configured; set RELAY_TOKEN or add "
+                    "groups[].sharedToken to config.json"
+                )
             if not self.global_token:
                 for definition in definitions:
                     if definition.group_id not in group_tokens:
@@ -956,24 +1153,23 @@ class MonitorManager:
         return result
 
     @staticmethod
-    def _public_monitor_config(item: dict[str, Any]) -> dict[str, Any]:
+    def _admin_monitor_config(item: dict[str, Any]) -> dict[str, Any]:
         headers = MonitorManager._headers_from_raw(item)
-        safe_url, url_masked = mask_url(str(item.get("url", "")))
         body_configured = item.get("body") is not None
         return {
             "id": item["id"],
             "groupId": item["groupId"],
             "name": item.get("name", ""),
-            "url": safe_url,
-            "urlMasked": url_masked,
+            "url": str(item.get("url", "")),
+            "urlMasked": False,
             "method": str(item.get("method", "GET")).upper(),
             "headersJson": json.dumps(
-                {name: KEEP_PLACEHOLDER for name in headers},
+                headers,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ),
             "headersConfigured": bool(headers),
-            "body": KEEP_PLACEHOLDER if body_configured else None,
+            "body": deepcopy(item.get("body")) if body_configured else None,
             "bodyConfigured": body_configured,
             "jsonPath": item.get("jsonPath", ""),
             "operator": item.get("operator", "<"),
@@ -993,12 +1189,106 @@ class MonitorManager:
 
     def list_monitor_configs(self, group_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            items = [
-                self._public_monitor_config(item)
+            return [
+                self._admin_monitor_config(item)
                 for (item_group, _), item in self._raw_monitors.items()
                 if item_group == group_id
             ]
-        return sorted(items, key=lambda item: (item["name"], item["id"]))
+
+    @staticmethod
+    def _monitor_id_list(value: Any, field_name: str) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name} must be an array")
+        monitor_ids = [
+            require_identifier(monitor_id, f"{field_name}[{index}]")
+            for index, monitor_id in enumerate(value)
+        ]
+        if len(set(monitor_ids)) != len(monitor_ids):
+            raise ValueError(f"{field_name} must not contain duplicate monitor ids")
+        return monitor_ids
+
+    def _group_monitor_ids_locked(self, group_id: str) -> list[str]:
+        return [
+            monitor_id
+            for item_group, monitor_id in self._raw_monitors
+            if item_group == group_id
+        ]
+
+    def _unique_copy_name_locked(self, group_id: str, source_name: str) -> str:
+        existing_names = {
+            str(item.get("name", ""))
+            for (item_group, _), item in self._raw_monitors.items()
+            if item_group == group_id
+        }
+        copy_number = 1
+        while True:
+            suffix = "（副本）" if copy_number == 1 else f"（副本{copy_number}）"
+            candidate = f"{source_name[:128 - len(suffix)]}{suffix}"
+            if candidate not in existing_names:
+                return candidate
+            copy_number += 1
+
+    def copy_monitor_config(self, group_id: str, monitor_id: str) -> dict[str, Any]:
+        key = (group_id, monitor_id)
+        with self._lock:
+            source = self._raw_monitors.get(key)
+            if source is None:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "monitor not found")
+
+            existing_ids = {existing_id for _, existing_id in self._raw_monitors}
+            copied_id = uuid.uuid4().hex
+            while copied_id in existing_ids:
+                copied_id = uuid.uuid4().hex
+            copied = deepcopy(source)
+            copied["id"] = copied_id
+            copied["groupId"] = group_id
+            copied["name"] = self._unique_copy_name_locked(
+                group_id, str(source.get("name", ""))
+            )
+            copied["enabled"] = False
+            copied["revision"] = 1
+            copied["updatedAt"] = now_ms()
+
+            raw_monitors: list[dict[str, Any]] = []
+            for raw_key, value in self._raw_monitors.items():
+                raw_monitors.append(dict(value))
+                if raw_key == key:
+                    raw_monitors.append(copied)
+            self._commit_raw_monitors_locked(raw_monitors)
+            return self._admin_monitor_config(copied)
+
+    def reorder_monitor_configs(
+        self,
+        group_id: str,
+        expected_monitor_ids: Any,
+        monitor_ids: Any,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            expected = self._monitor_id_list(
+                expected_monitor_ids, "expectedMonitorIds"
+            )
+            requested = self._monitor_id_list(monitor_ids, "monitorIds")
+            current = self._group_monitor_ids_locked(group_id)
+            if expected != current or set(requested) != set(current):
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "order_conflict",
+                    "monitor order changed; refresh and retry",
+                )
+
+            requested_iterator = iter(requested)
+            raw_monitors: list[dict[str, Any]] = []
+            for (item_group, _), value in self._raw_monitors.items():
+                if item_group == group_id:
+                    requested_id = next(requested_iterator)
+                    value = self._raw_monitors[(group_id, requested_id)]
+                raw_monitors.append(dict(value))
+            self._commit_raw_monitors_locked(raw_monitors)
+            return [
+                self._admin_monitor_config(item)
+                for (item_group, _), item in self._raw_monitors.items()
+                if item_group == group_id
+            ]
 
     def create_monitor_config(self, candidate: dict[str, Any]) -> dict[str, Any]:
         group_id = require_identifier(candidate.get("groupId"), "groupId")
@@ -1013,7 +1303,7 @@ class MonitorManager:
             item = self._normalize_admin_document(candidate, None, monitor_id, group_id)
             raw_monitors = [dict(value) for value in self._raw_monitors.values()] + [item]
             self._commit_raw_monitors_locked(raw_monitors)
-            return self._public_monitor_config(item)
+            return self._admin_monitor_config(item)
 
     def update_monitor_config(
         self, group_id: str, monitor_id: str, candidate: dict[str, Any]
@@ -1040,7 +1330,7 @@ class MonitorManager:
                 for raw_key, value in self._raw_monitors.items()
             ]
             self._commit_raw_monitors_locked(raw_monitors)
-            return self._public_monitor_config(item)
+            return self._admin_monitor_config(item)
 
     def delete_monitor_config(self, group_id: str, monitor_id: str) -> None:
         key = (group_id, monitor_id)
@@ -1054,34 +1344,194 @@ class MonitorManager:
             ]
             self._commit_raw_monitors_locked(raw_monitors)
 
-    def test_monitor_config(self, group_id: str, monitor_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _monitor_test_error(
+        code: str, message: str, http_code: int | None = None
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "serverTime": now_ms(),
+            "error": {
+                "code": code,
+                "message": message,
+                "httpCode": http_code,
+            },
+        }
+
+    def _release_in_flight(self, key: tuple[str, str]) -> None:
         with self._lock:
-            definition = self._definitions.get((group_id, monitor_id))
-        if definition is None:
-            raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "monitor not found")
+            self._in_flight.discard(key)
+        self._wake.set()
+
+    def _test_monitor_definition(self, definition: MonitorDefinition) -> dict[str, Any]:
+        key = (definition.group_id, definition.id)
         try:
             http_code, raw_value, value = self._fetch_value(definition)
+            timestamp = now_ms()
+            breached = compare_value(value, definition.operator, definition.threshold)
+            with self._lock:
+                status = self._statuses.get(key)
+                if status is None or status.definition != definition:
+                    return self._monitor_test_error(
+                        "monitor_changed",
+                        "monitor was changed during the test; result was not published",
+                    )
+                status.last_check_at = timestamp
+                status.last_success_at = timestamp
+                status.last_http_code = http_code
+                status.last_raw_value = raw_value
+                status.last_value = value
+                status.last_error = ""
+                status.breached = breached
+                status.consecutive_errors = 0
             return {
                 "ok": True,
-                "serverTime": now_ms(),
+                "serverTime": timestamp,
                 "result": {
                     "httpCode": http_code,
                     "rawValue": raw_value,
                     "value": value,
-                    "breached": compare_value(value, definition.operator, definition.threshold),
+                    "breached": breached,
                 },
             }
         except Exception as error:
+            with self._lock:
+                status = self._statuses.get(key)
+                if status is None or status.definition != definition:
+                    return self._monitor_test_error(
+                        "monitor_changed",
+                        "monitor was changed during the test; result was not published",
+                    )
             fetch_error = error if isinstance(error, MonitorFetchError) else MonitorFetchError(str(error))
+            return self._monitor_test_error(
+                "monitor_test_failed",
+                str(fetch_error)[:1000],
+                fetch_error.http_code,
+            )
+
+    def test_monitor_config(self, group_id: str, monitor_id: str) -> dict[str, Any]:
+        key = (group_id, monitor_id)
+        with self._lock:
+            definition = self._definitions.get(key)
+            if definition is None:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "monitor not found")
+            if key in self._in_flight:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "monitor_busy",
+                    "monitor check already in progress",
+                )
+            self._in_flight.add(key)
+        try:
+            return self._test_monitor_definition(definition)
+        finally:
+            self._release_in_flight(key)
+
+    def refresh_monitor_configs(self, group_id: str) -> dict[str, Any]:
+        if not self._refresh_lock.acquire(blocking=False):
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "refresh_in_progress",
+                "monitor refresh already in progress",
+            )
+        try:
+            with self._lock:
+                enabled_monitors = [
+                    definition
+                    for (definition_group, _), definition in self._definitions.items()
+                    if definition_group == group_id and definition.enabled
+                ]
+
+            jobs: list[
+                tuple[MonitorDefinition, Future[dict[str, Any]] | None, dict[str, Any] | None]
+            ] = []
+            for definition in enabled_monitors:
+                key = (definition.group_id, definition.id)
+                with self._lock:
+                    if key in self._in_flight:
+                        jobs.append(
+                            (
+                                definition,
+                                None,
+                                self._monitor_test_error(
+                                    "monitor_busy",
+                                    "monitor check already in progress",
+                                ),
+                            )
+                        )
+                        continue
+                    self._in_flight.add(key)
+                try:
+                    future = self._executor.submit(
+                        self._test_monitor_definition, definition
+                    )
+                except RuntimeError:
+                    self._release_in_flight(key)
+                    jobs.append(
+                        (
+                            definition,
+                            None,
+                            self._monitor_test_error(
+                                "monitor_refresh_failed",
+                                "monitor executor is unavailable",
+                            ),
+                        )
+                    )
+                else:
+                    future.add_done_callback(
+                        lambda _completed, monitor_key=key: self._release_in_flight(
+                            monitor_key
+                        )
+                    )
+                    jobs.append((definition, future, None))
+
+            results: list[dict[str, Any]] = []
+            for definition, future, immediate_outcome in jobs:
+                if immediate_outcome is not None:
+                    outcome = immediate_outcome
+                elif future is not None:
+                    try:
+                        outcome = future.result()
+                    except Exception:
+                        outcome = self._monitor_test_error(
+                            "monitor_refresh_failed",
+                            "monitor became unavailable during refresh",
+                        )
+                else:  # Defensive fallback for an invalid internal job record.
+                    outcome = self._monitor_test_error(
+                        "monitor_refresh_failed", "monitor refresh failed"
+                    )
+                item = {
+                    "monitorId": definition.id,
+                    "monitorName": definition.name,
+                    "ok": bool(outcome.get("ok")),
+                }
+                if item["ok"]:
+                    item["result"] = deepcopy(outcome.get("result", {}))
+                else:
+                    item["error"] = deepcopy(
+                        outcome.get(
+                            "error",
+                            {
+                                "code": "monitor_refresh_failed",
+                                "message": "monitor refresh failed",
+                                "httpCode": None,
+                            },
+                        )
+                    )
+                results.append(item)
+
+            succeeded = sum(1 for item in results if item["ok"])
             return {
-                "ok": False,
+                "ok": succeeded == len(results),
                 "serverTime": now_ms(),
-                "error": {
-                    "code": "monitor_test_failed",
-                    "message": str(fetch_error)[:1000],
-                    "httpCode": fetch_error.http_code,
-                },
+                "total": len(results),
+                "succeeded": succeeded,
+                "failed": len(results) - succeeded,
+                "results": results,
             }
+        finally:
+            self._refresh_lock.release()
 
     def has_authentication(self) -> bool:
         with self._lock:
@@ -1102,9 +1552,17 @@ class MonitorManager:
             candidates = [token for token in (group_token, self.global_token) if token]
         return any(hmac.compare_digest(supplied_token, candidate) for candidate in candidates)
 
+    def single_group_id(self) -> str | None:
+        """Return the configured group only when routing is unambiguous."""
+        with self._lock:
+            if len(self._group_tokens) != 1:
+                return None
+            return next(iter(self._group_tokens))
+
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._scheduler_error = ""
         self._thread = threading.Thread(target=self._scheduler_loop, name="monitor-scheduler", daemon=True)
         self._thread.start()
 
@@ -1118,29 +1576,44 @@ class MonitorManager:
     def _scheduler_loop(self) -> None:
         next_reload = time.monotonic()
         while not self._stop.is_set():
-            monotonic_now = time.monotonic()
-            if monotonic_now >= next_reload:
-                self.reload(force=False)
-                next_reload = monotonic_now + self.reload_interval_seconds
-            timestamp = now_ms()
-            due: list[tuple[tuple[str, str], MonitorDefinition]] = []
-            with self._lock:
-                for key, status in self._statuses.items():
-                    if (
-                        status.definition.enabled
-                        and key not in self._in_flight
-                        and status.next_check_at <= timestamp
-                    ):
-                        self._in_flight.add(key)
-                        status.next_check_at = timestamp + status.definition.poll_interval_seconds * 1000
-                        due.append((key, status.definition))
-            for key, definition in due:
-                future = self._executor.submit(self._execute_check, definition)
-                future.add_done_callback(
-                    lambda completed, monitor_key=key: self._check_finished(
-                        monitor_key, completed
+            try:
+                monotonic_now = time.monotonic()
+                if monotonic_now >= next_reload:
+                    self.reload(force=False)
+                    next_reload = monotonic_now + self.reload_interval_seconds
+                timestamp = now_ms()
+                due: list[tuple[tuple[str, str], MonitorDefinition]] = []
+                with self._lock:
+                    self._scheduler_last_tick_at = timestamp
+                    for key, status in self._statuses.items():
+                        if (
+                            status.definition.enabled
+                            and key not in self._in_flight
+                            and status.next_check_at <= timestamp
+                        ):
+                            self._in_flight.add(key)
+                            status.next_check_at = (
+                                timestamp + status.definition.poll_interval_seconds * 1000
+                            )
+                            due.append((key, status.definition))
+                for key, definition in due:
+                    try:
+                        future = self._executor.submit(self._execute_check, definition)
+                    except RuntimeError:
+                        self._release_in_flight(key)
+                        continue
+                    else:
+                        future.add_done_callback(
+                            lambda completed, monitor_key=key: self._check_finished(
+                                monitor_key, completed
+                            )
+                        )
+            except Exception as error:
+                with self._lock:
+                    self._scheduler_error = (
+                        f"monitor scheduler failed ({type(error).__name__})"
                     )
-                )
+                print(f"warning: monitor scheduler iteration failed: {error}", file=sys.stderr)
             self._wake.wait(timeout=0.5)
             self._wake.clear()
 
@@ -1149,8 +1622,7 @@ class MonitorManager:
             error = future.exception()
         except CancelledError:
             error = None
-        with self._lock:
-            self._in_flight.discard(key)
+        self._release_in_flight(key)
         if error is not None:
             print(
                 f"warning: monitor check {key[0]}/{key[1]} failed: {error}",
@@ -1159,11 +1631,18 @@ class MonitorManager:
 
     def check_monitor(self, group_id: str, monitor_id: str) -> None:
         """Run one check synchronously; used by tests and operational diagnostics."""
+        key = (group_id, monitor_id)
         with self._lock:
-            definition = self._definitions.get((group_id, monitor_id))
-        if definition is None:
-            raise KeyError(f"unknown monitor {group_id}/{monitor_id}")
-        self._execute_check(definition)
+            definition = self._definitions.get(key)
+            if definition is None:
+                raise KeyError(f"unknown monitor {group_id}/{monitor_id}")
+            if key in self._in_flight:
+                raise RuntimeError(f"monitor check already in progress: {group_id}/{monitor_id}")
+            self._in_flight.add(key)
+        try:
+            self._execute_check(definition)
+        finally:
+            self._release_in_flight(key)
 
     def _fetch_value(self, definition: MonitorDefinition) -> tuple[int, float, float]:
         headers = dict(definition.headers)
@@ -1226,7 +1705,7 @@ class MonitorManager:
                 status = self._statuses.get(key)
                 if status is None or status.definition != definition:
                     return
-                was_breached = status.breached
+                was_breached = status.alert_breached
                 repeat_due = (
                     definition.alert_repeat_seconds > 0
                     and timestamp - status.last_alert_at >= definition.alert_repeat_seconds * 1000
@@ -1239,6 +1718,8 @@ class MonitorManager:
                 status.last_error = ""
                 status.breached = breached
                 status.consecutive_errors = 0
+                status.alert_breached = breached
+                status.alert_consecutive_errors = 0
                 status.next_check_at = timestamp + definition.poll_interval_seconds * 1000
                 if breached and (not was_breached or repeat_due):
                     rollback = ("breach", was_breached, status.last_alert_at)
@@ -1257,11 +1738,12 @@ class MonitorManager:
                 status = self._statuses.get(key)
                 if status is None or status.definition != definition:
                     return
-                previous_errors = status.consecutive_errors
+                previous_errors = status.alert_consecutive_errors
                 status.last_check_at = timestamp
                 status.last_http_code = fetch_error.http_code
                 status.last_error = str(fetch_error)[:1000]
-                status.consecutive_errors += 1
+                status.alert_consecutive_errors += 1
+                status.consecutive_errors = status.alert_consecutive_errors
                 status.next_check_at = timestamp + definition.poll_interval_seconds * 1000
                 crossed_threshold = (
                     previous_errors < definition.error_alert_after
@@ -1269,7 +1751,7 @@ class MonitorManager:
                 )
                 repeat_due = (
                     definition.alert_repeat_seconds > 0
-                    and status.consecutive_errors >= definition.error_alert_after
+                    and status.alert_consecutive_errors >= definition.error_alert_after
                     and timestamp - status.last_alert_at >= definition.alert_repeat_seconds * 1000
                 )
                 if crossed_threshold or repeat_due:
@@ -1304,26 +1786,47 @@ class MonitorManager:
                         kind, previous_value, previous_alert_at = rollback
                         status.last_alert_at = previous_alert_at
                         if kind == "breach":
-                            status.breached = bool(previous_value)
+                            status.alert_breached = bool(previous_value)
                         else:
+                            status.alert_consecutive_errors = int(previous_value)
                             status.consecutive_errors = int(previous_value)
                         status.last_error = f"could not persist alert: {error}"[:1000]
                 raise
 
-    def config_status(self) -> dict[str, Any]:
+    def config_status(self, probe_storage: bool = False) -> dict[str, Any]:
         with self._lock:
-            return {
-                "loaded": self._loaded,
-                "lastLoadedAt": self._last_loaded_at,
-                "lastError": self._last_error,
-            }
+            scheduler_alive = self._thread is None or self._thread.is_alive()
+            scheduler_error = self._scheduler_error
+            if not scheduler_alive and not scheduler_error:
+                scheduler_error = "monitor scheduler is not running"
+            loaded = self._loaded
+            last_loaded_at = self._last_loaded_at
+            config_error = self._last_error
+            scheduler_last_tick_at = self._scheduler_last_tick_at
+        storage = self.relay_state.storage_status(probe=probe_storage)
+        errors = [
+            error
+            for error in (config_error, scheduler_error, storage["lastError"])
+            if error
+        ]
+        return {
+            "loaded": loaded,
+            "lastLoadedAt": last_loaded_at,
+            "lastError": "; ".join(errors),
+            "schedulerAlive": scheduler_alive,
+            "schedulerLastTickAt": scheduler_last_tick_at,
+            "storage": storage,
+        }
 
     @staticmethod
     def _public_status(status: MonitorStatus) -> dict[str, Any]:
         definition = status.definition
+        safe_url, _ = mask_url(definition.url)
         return {
             "id": definition.id,
             "name": definition.name,
+            "url": safe_url,
+            "method": definition.method,
             "enabled": definition.enabled,
             "operator": definition.operator,
             "threshold": definition.threshold,
@@ -1341,12 +1844,11 @@ class MonitorManager:
 
     def statuses_for_group(self, group_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            statuses = [
+            return [
                 self._public_status(status)
                 for (status_group, _), status in self._statuses.items()
                 if status_group == group_id
             ]
-        return sorted(statuses, key=lambda item: (item["name"], item["id"]))
 
     def summary(self, group_id: str | None = None) -> dict[str, int]:
         with self._lock:
@@ -1388,9 +1890,10 @@ class RelayApplication:
         )
 
     def health(self) -> dict[str, Any]:
-        config = self.monitor_manager.config_status()
+        config = self.monitor_manager.config_status(probe_storage=True)
+        healthy = config["loaded"] and not config["lastError"]
         return {
-            "status": "ok",
+            "status": "ok" if healthy else "degraded",
             "service": "credit-inform-relay",
             "version": VERSION,
             "serverInstanceId": self.relay_state.server_instance_id,
@@ -1399,7 +1902,8 @@ class RelayApplication:
             "heartbeatTimeoutSeconds": self.relay_state.heartbeat_timeout_ms // 1000,
             "clients": self.relay_state.client_counts(),
             "monitors": self.monitor_manager.summary(),
-            "monitoringStatus": "ok" if config["loaded"] and not config["lastError"] else "degraded",
+            "monitoringStatus": "ok" if healthy else "degraded",
+            "config": config,
         }
 
 
@@ -1427,13 +1931,20 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                 path = parsed.path.rstrip("/") or "/"
                 query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
                 if path == "/health":
-                    self._send_json(HTTPStatus.OK, application.health())
+                    health = application.health()
+                    self._send_json(
+                        HTTPStatus.OK
+                        if health["status"] == "ok"
+                        else HTTPStatus.SERVICE_UNAVAILABLE,
+                        health,
+                    )
                     return
                 if path == "/api/v1/alerts":
-                    group_id = self._query_identifier(query, "groupId")
+                    group_id = self._query_group_id(query)
                     self._require_group_auth(group_id)
                     client_id = self._query_identifier(query, "clientId")
                     after = self._query_integer(query, "after", default=0, minimum=0)
+                    after_token = self._query_optional_hex_token(query, "afterToken")
                     wait_seconds = self._query_float(
                         query,
                         "wait",
@@ -1441,35 +1952,47 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                         minimum=0,
                         maximum=application.max_poll_seconds,
                     )
-                    events, cursor = application.relay_state.poll(
-                        group_id, client_id, after, wait_seconds
+                    (
+                        events,
+                        cursor,
+                        cursor_token,
+                        cursor_valid,
+                        head_cursor,
+                        head_event_uid,
+                    ) = application.relay_state.poll_with_cursor_token(
+                        group_id, client_id, after, after_token, wait_seconds
                     )
                     self._send_json(
                         HTTPStatus.OK,
                         {
                             "alerts": events,
                             "cursor": cursor,
-                            "headCursor": application.relay_state.current_cursor(group_id),
+                            "cursorToken": cursor_token,
+                            "cursorValid": cursor_valid,
+                            "headCursor": head_cursor,
+                            "headEventUid": head_event_uid,
                             "serverInstanceId": application.relay_state.server_instance_id,
                             "serverTime": now_ms(),
                         },
                     )
                     return
                 if path == "/api/v1/monitors":
-                    group_id = self._query_identifier(query, "groupId")
+                    group_id = self._query_group_id(query)
                     self._require_group_auth(group_id)
                     self._send_json(
                         HTTPStatus.OK,
                         {
                             "serverTime": now_ms(),
-                            "config": application.monitor_manager.config_status(),
+                            "config": application.monitor_manager.config_status(
+                                probe_storage=True
+                            ),
                             "monitors": application.monitor_manager.statuses_for_group(group_id),
                         },
                     )
                     return
                 if path == "/api/v1/admin/monitors":
                     self._require_admin_auth()
-                    group_id = self._query_identifier(query, "groupId")
+                    group_id = self._query_group_id(query)
                     self._send_json(
                         HTTPStatus.OK,
                         {
@@ -1482,8 +2005,11 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 if path == "/api/v1/status":
-                    group_id = self._query_identifier(query, "groupId")
+                    group_id = self._query_group_id(query)
                     self._require_group_auth(group_id)
+                    head_cursor, head_event_uid, cursor_token = (
+                        application.relay_state.cursor_state()
+                    )
                     self._send_json(
                         HTTPStatus.OK,
                         {
@@ -1491,10 +2017,15 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                             "serverTime": now_ms(),
                             "serverInstanceId": application.relay_state.server_instance_id,
                             "groupId": group_id,
-                            "cursor": application.relay_state.current_cursor(group_id),
+                            "cursor": head_cursor,
+                            "cursorToken": cursor_token,
+                            "headCursor": head_cursor,
+                            "headEventUid": head_event_uid,
                             "clients": application.relay_state.client_counts(group_id),
                             "monitors": application.monitor_manager.summary(group_id),
-                            "config": application.monitor_manager.config_status(),
+                            "config": application.monitor_manager.config_status(
+                                probe_storage=True
+                            ),
                         },
                     )
                     return
@@ -1512,7 +2043,7 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                 path = urllib.parse.urlsplit(self.path).path.rstrip("/") or "/"
                 body = self._read_json_object()
                 if path in ("/api/v1/clients/register", "/api/v1/clients/heartbeat"):
-                    group_id = self._body_identifier(body, "groupId")
+                    group_id = self._body_group_id(body)
                     self._require_group_auth(group_id)
                     client_id = self._body_identifier(body, "clientId")
                     client_name = require_text(
@@ -1524,6 +2055,9 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                         else application.relay_state.heartbeat
                     )
                     client, cursor = operation(group_id, client_id, client_name)
+                    head_cursor, head_event_uid, cursor_token = (
+                        application.relay_state.cursor_state(cursor)
+                    )
                     self._send_json(
                         HTTPStatus.OK,
                         {
@@ -1531,13 +2065,16 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                             "serverTime": now_ms(),
                             "serverInstanceId": application.relay_state.server_instance_id,
                             "cursor": cursor,
+                            "cursorToken": cursor_token,
+                            "headCursor": head_cursor,
+                            "headEventUid": head_event_uid,
                             "client": client,
                             "clients": application.relay_state.client_counts(group_id),
                         },
                     )
                     return
                 if path == "/api/v1/alerts":
-                    group_id = self._body_identifier(body, "groupId")
+                    group_id = self._body_group_id(body)
                     self._require_group_auth(group_id)
                     sender_id = self._body_identifier(body, "senderId")
                     sender_name = require_text(
@@ -1568,7 +2105,57 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                     return
                 if path == "/api/v1/admin/monitors":
                     self._require_admin_auth()
-                    monitor = application.monitor_manager.create_monitor_config(body)
+                    candidate = dict(body)
+                    candidate["groupId"] = self._body_group_id(body)
+                    monitor = application.monitor_manager.create_monitor_config(candidate)
+                    self._send_json(
+                        HTTPStatus.CREATED,
+                        {
+                            "ok": True,
+                            "serverTime": now_ms(),
+                            "keepPlaceholder": KEEP_PLACEHOLDER,
+                            "monitor": monitor,
+                        },
+                    )
+                    return
+                if path == "/api/v1/admin/monitors/reorder":
+                    self._require_admin_auth()
+                    group_id = self._body_group_id(body)
+                    monitors = application.monitor_manager.reorder_monitor_configs(
+                        group_id,
+                        body.get("expectedMonitorIds"),
+                        body.get("monitorIds"),
+                    )
+                    self._send_json(
+                        HTTPStatus.OK,
+                        {
+                            "ok": True,
+                            "serverTime": now_ms(),
+                            "keepPlaceholder": KEEP_PLACEHOLDER,
+                            "monitors": monitors,
+                        },
+                    )
+                    return
+                if path == "/api/v1/admin/monitors/refresh":
+                    self._require_admin_auth()
+                    group_id = self._body_group_id(body)
+                    self._send_json(
+                        HTTPStatus.OK,
+                        application.monitor_manager.refresh_monitor_configs(group_id),
+                    )
+                    return
+                copy_match = re.fullmatch(
+                    r"/api/v1/admin/monitors/([^/]+)/copy", path
+                )
+                if copy_match:
+                    self._require_admin_auth()
+                    monitor_id = require_identifier(
+                        urllib.parse.unquote(copy_match.group(1)), "id"
+                    )
+                    group_id = self._body_group_id(body)
+                    monitor = application.monitor_manager.copy_monitor_config(
+                        group_id, monitor_id
+                    )
                     self._send_json(
                         HTTPStatus.CREATED,
                         {
@@ -1587,7 +2174,7 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                     monitor_id = require_identifier(
                         urllib.parse.unquote(admin_match.group(1)), "id"
                     )
-                    group_id = self._body_identifier(body, "groupId")
+                    group_id = self._body_group_id(body)
                     self._send_json(
                         HTTPStatus.OK,
                         application.monitor_manager.test_monitor_config(
@@ -1624,7 +2211,7 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                 self._require_admin_auth()
                 monitor_id = require_identifier(urllib.parse.unquote(match.group(1)), "id")
                 body = self._read_json_object()
-                group_id = self._body_identifier(body, "groupId")
+                group_id = self._body_group_id(body)
                 monitor = application.monitor_manager.update_monitor_config(
                     group_id, monitor_id, body
                 )
@@ -1663,7 +2250,7 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                 self._require_admin_auth()
                 monitor_id = require_identifier(urllib.parse.unquote(match.group(1)), "id")
                 query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-                group_id = self._query_identifier(query, "groupId")
+                group_id = self._query_group_id(query)
                 application.monitor_manager.delete_monitor_config(group_id, monitor_id)
                 self._send_json(
                     HTTPStatus.OK, {"ok": True, "serverTime": now_ms()}
@@ -1710,12 +2297,32 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
             except ValueError as error:
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", str(error)) from error
 
+        def _default_group_id(self) -> str:
+            group_id = application.monitor_manager.single_group_id()
+            if group_id is None:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "group_required",
+                    "groupId is required unless exactly one group is configured",
+                )
+            return group_id
+
+        def _body_group_id(self, body: dict[str, Any]) -> str:
+            if "groupId" in body:
+                return self._body_identifier(body, "groupId")
+            return self._default_group_id()
+
         @staticmethod
         def _query_identifier(query: dict[str, list[str]], name: str) -> str:
             try:
                 return require_identifier(query.get(name, [None])[0], name)
             except ValueError as error:
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", str(error)) from error
+
+        def _query_group_id(self, query: dict[str, list[str]]) -> str:
+            if "groupId" in query:
+                return self._query_identifier(query, "groupId")
+            return self._default_group_id()
 
         @staticmethod
         def _query_integer(
@@ -1728,6 +2335,28 @@ def make_handler(application: RelayApplication) -> type[BaseHTTPRequestHandler]:
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", f"{name} must be an integer") from error
             if value < minimum:
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", f"{name} must be >= {minimum}")
+            return value
+
+        @staticmethod
+        def _query_optional_hex_token(
+            query: dict[str, list[str]], name: str
+        ) -> str | None:
+            values = query.get(name)
+            if values is None:
+                return None
+            if len(values) != 1:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_request",
+                    f"{name} must be specified once",
+                )
+            value = values[0]
+            if not re.fullmatch(r"[0-9a-f]{32}", value):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_request",
+                    f"{name} must be a 32-character lowercase hex string",
+                )
             return value
 
         @staticmethod

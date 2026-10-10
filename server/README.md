@@ -3,9 +3,9 @@
 这个服务同时完成两件事：
 
 - Android 客户端之间的手动报警中继。
-- 在服务端集中轮询业务接口，并将余额越界或连续检测失败广播给同组客户端。
+- 在服务端集中轮询业务接口，并将余额越界或连续检测失败广播给客户端。
 
-Android App 只需配置本服务的地址、`groupId` 和共享密钥，不需要保存业务接口的密钥。
+Android App 只需配置本服务的地址和共享密钥，不需要填写通信组，也不需要保存业务接口的密钥。
 服务只使用 Python 标准库，不需要安装第三方包。
 
 ## 快速启动
@@ -15,7 +15,7 @@ Android App 只需配置本服务的地址、`groupId` 和共享密钥，不需�
 ```bash
 cd server
 cp config.example.json config.json
-# 修改 group id、共享密钥和初始监控项后启动
+# 修改共享密钥和初始监控项后启动
 ADMIN_TOKEN='另一个独立的长随机密钥' python3 relay_server.py
 ```
 
@@ -25,9 +25,10 @@ ADMIN_TOKEN='另一个独立的长随机密钥' python3 relay_server.py
 curl http://127.0.0.1:8047/health
 ```
 
-`config.json` 中的 `groups[].sharedToken` 是普通客户端密钥；`ADMIN_TOKEN` 只用于在
-App 中增删改监控配置。两者必须不同。也可以设置 `RELAY_TOKEN`，让所有组共用一个
-普通客户端密钥，适合只有一个通信组的最简部署。
+`config.json` 中唯一一项 `groups[].sharedToken` 是普通客户端密钥；`ADMIN_TOKEN` 只用于在
+App 中增删改监控配置。两者必须不同。`groups[].id` 和监控项内的 `groupId` 是服务端为兼容
+旧数据保留的内部标识，新客户端不需要配置或提交。也可以设置 `RELAY_TOKEN` 作为普通客户端
+密钥。
 
 ## Docker 部署
 
@@ -39,13 +40,15 @@ cp config.example.json runtime/config/config.json
 sudo chown -R 10001:10001 runtime/config
 sudo chmod 700 runtime/config
 sudo chmod 600 runtime/config/config.json
+mkdir -p relay-data
+sudo chown 10001:10001 relay-data
+sudo chmod 700 relay-data
 docker build -t credit-inform-relay .
-docker volume create credit-inform-relay-data
 docker run -d --name credit-inform-relay --restart unless-stopped \
   -p 8047:8047 \
   -e ADMIN_TOKEN='另一个独立的长随机密钥' \
   -v "$PWD/runtime/config:/app/config:ro" \
-  -v credit-inform-relay-data:/app/data \
+  -v "$PWD/relay-data:/app/data" \
   credit-inform-relay
 ```
 
@@ -53,15 +56,15 @@ docker run -d --name credit-inform-relay --restart unless-stopped \
 后直接执行 `docker compose up -d --build`；缺少 `ADMIN_TOKEN` 时 Compose 会拒绝启动。
 Compose 默认只绑定 `127.0.0.1:8047`，适合由同机反向代理提供 HTTPS。在受信任
 局域网内直接测试时，可在 `.env` 设置 `BIND_ADDRESS=0.0.0.0`，但不要以明文 HTTP
-暴露到公网。Compose 使用 Docker named volume 保存 `/app/data`，首次挂载会继承镜像内
-UID 10001 的权限，无需给宿主机目录开放写权限。
+暴露到公网。Compose 使用项目目录下的 `relay-data` 保存 `/app/data`；启动前请让该目录
+归属容器内的 UID 10001，并限制为仅服务用户可读写。
 
 生产环境应在 Caddy、Nginx 或云负载均衡后启用 HTTPS，不要通过公网明文传输共享密钥。
 建议用 `--env-file` 或容器密钥管理功能注入 `ADMIN_TOKEN`，避免密钥留在命令历史中。
 
 ## 基础配置
 
-完整示例见 `config.example.json`。基础文件包含通信组以及仅在第一次启动时导入的监控项：
+完整示例见 `config.example.json`。基础文件包含一个内部兼容组以及仅在第一次启动时导入的监控项：
 
 ```json
 {
@@ -115,7 +118,7 @@ UID 10001 的权限，无需给宿主机目录开放写权限。
 
 首次启动会把 `config.json` 的 `monitors` 原子导入
 `data/monitor-configs.json`。之后 App 的管理界面读写这个独立文件；修改
-`config.json` 中的初始监控项不会覆盖 App 已管理的数据。通信组和共享密钥仍会自动热加载，
+`config.json` 中的初始监控项不会覆盖 App 已管理的数据。内部组和共享密钥仍会自动热加载，
 管理数据文件被外部原子替换时也会热加载。默认每 2 秒检查一次文件变化。
 示例监控默认关闭；在 App 中先执行一次“测试”，确认取值和换算正确后再启用。
 
@@ -137,19 +140,27 @@ UID 10001 的权限，无需给宿主机目录开放写权限。
 
 ## 客户端 API
 
-除 `/health` 外都需要 `Authorization: Bearer <该组 sharedToken>`，请求和响应均为 JSON。
+除 `/health` 外都需要 `Authorization: Bearer <sharedToken>`，请求和响应均为 JSON。
 时间字段为 Unix epoch 毫秒，事件 ID/游标为递增 JSON number。
+
+服务端恰好配置一个组时，以下所有 API 都可以省略 `groupId`，这是 App 使用的默认方式。
+旧客户端仍可显式提交原有 `groupId`。只有多组兼容部署才必须显式提交，否则返回
+`group_required`；服务端不会猜测目标组。
 
 ### 服务状态
 
 ```http
 GET /health
-GET /api/v1/status?groupId=customer-service
-GET /api/v1/monitors?groupId=customer-service
+GET /api/v1/status
+GET /api/v1/monitors
 ```
 
-`/health` 可用于 App 的服务连通性检测。`/api/v1/monitors` 返回每个服务端监控项的
-最近原始值、换算值、HTTP 状态、错误、越界状态和下次检测时间，不返回请求密钥。
+`/health` 可用于服务连通性检测。配置、调度线程或事件持久化异常时返回 HTTP 503 和
+`status: "degraded"`，Docker 健康检查会据此失败；一次事件状态重新成功落盘后，存储
+故障状态会恢复。`/api/v1/monitors` 返回同样的配置/存储健康信息，以及每个监控项的
+请求方法、脱敏 URL、最近原始值、换算值、HTTP 状态、错误、越界状态和下次检测时间。
+URL 的查询参数值和用户信息会替换为 `__KEEP__`，fragment 会移除，header 和 body 不返回。
+监控项按服务端管理文件中的数组顺序返回。
 
 ### 注册和心跳
 
@@ -159,23 +170,24 @@ POST /api/v1/clients/heartbeat
 Authorization: Bearer <sharedToken>
 Content-Type: application/json
 
-{"groupId":"customer-service","clientId":"stable-device-id","clientName":"客服手机"}
+{"clientId":"stable-device-id"}
 ```
 
-响应中的 `cursor` 是服务端当前已分配事件 ID 的高水位。客户端仅在第一次注册时保存它，可以避免安装后
-重放历史报警；后续重连应继续使用本地已确认的游标。响应还包含同组
-`clients:{online,total}`。
+响应中的 `cursor` 是服务端当前已分配事件 ID 的高水位，`cursorToken` 是该游标对应的
+随机令牌。客户端仅在第一次注册时保存它们，可以避免安装后重放历史报警；后续重连应
+继续使用本地已确认的游标和令牌。响应还包含 `clients:{online,total}`。省略旧版
+`clientName` 时，服务端使用 `clientId` 作为显示名。
 
 ### 手动报警和长轮询
 
 ```http
 POST /api/v1/alerts
 
-{"groupId":"customer-service","senderId":"device-a","senderName":"客服","message":"请立即处理"}
+{"senderId":"device-a","message":"请立即处理"}
 ```
 
 ```http
-GET /api/v1/alerts?groupId=customer-service&clientId=device-b&after=123&wait=25
+GET /api/v1/alerts?clientId=device-b&after=123&afterToken=62bb73f844af48cfb2c640a8e9cb6371&wait=25
 ```
 
 `wait` 最大 30 秒。响应格式：
@@ -198,6 +210,8 @@ GET /api/v1/alerts?groupId=customer-service&clientId=device-b&after=123&wait=25
     }
   ],
   "cursor": 124,
+  "cursorToken": "62bb73f844af48cfb2c640a8e9cb6371",
+  "cursorValid": true,
   "headCursor": 124,
   "serverTime": 1787910000001
 }
@@ -210,31 +224,93 @@ GET /api/v1/alerts?groupId=customer-service&clientId=device-b&after=123&wait=25
 持久化的随机 `eventUid`；Android 用它标识本地未确认报警，因此服务实例变化或从旧备份
 回滚后复用数字 ID 时，新旧报警也不会互相覆盖或误确认。
 
+客户端每次轮询都应把本地 `cursorToken` 作为 `afterToken` 一并提交。服务端若发现该数字
+游标已因旧备份恢复而指向另一事件，会返回 `cursorValid:false`、`cursor:0`、
+`cursorToken:null` 和空 `alerts`；客户端必须清空游标，再从 0 重拉。正常响应为
+`cursorValid:true`，并返回新 `cursor` 对应的 `cursorToken`。未提供 `afterToken` 的旧客户端
+仍可使用接口，但无法检测“备份回滚后事件编号恰好追平”这一情况。
+
 ## App 监控配置 API
 
 这些端点只接受 `Authorization: Bearer <ADMIN_TOKEN>`。普通 `sharedToken` 或
 `RELAY_TOKEN` 不能读写配置。
 
 ```http
-GET    /api/v1/admin/monitors?groupId=customer-service
+GET    /api/v1/admin/monitors
 POST   /api/v1/admin/monitors
 PUT    /api/v1/admin/monitors/{id}
-DELETE /api/v1/admin/monitors/{id}?groupId=customer-service
+DELETE /api/v1/admin/monitors/{id}
 POST   /api/v1/admin/monitors/{id}/test
+POST   /api/v1/admin/monitors/{id}/copy
+POST   /api/v1/admin/monitors/reorder
+POST   /api/v1/admin/monitors/refresh
 ```
 
-新建请求是平铺的监控对象并包含 `groupId`；`id` 可省略，由服务端生成。管理 API 使用
+新建请求是平铺的监控对象；`id` 可省略，由服务端生成。管理 API 使用
 `headersJson`（JSON 对象字符串），其他字段与上面的基础配置一致。测试请求体仅需
-`{"groupId":"customer-service"}`，成功时返回 HTTP 状态、原始值、换算值和是否越界，
-但不会改变正式监控状态或生成报警。
+`{}`，成功时返回 HTTP 状态、原始值、换算值和是否越界，
+同时更新共享监控列表中的最近检测时间、HTTP 状态和最新值。手动测试不会生成报警，也不会
+推迟下一次自动检测；测试失败只在本次响应中返回，不累计自动检测错误。
 
-GET/POST/PUT 返回 `keepPlaceholder: "__KEEP__"`。安全规则如下：
+批量刷新请求体也是 `{}`。服务端会并发测试当前所有已启用监控，成功项立即更新共享监控
+快照，停用项不会执行。某一项失败不会阻断其他项，批处理本身仍返回 HTTP 200，并通过
+`ok:false` 和逐项结果报告失败；鉴权或组解析失败才返回非 2xx：
 
-- 所有 header 值固定返回 `__KEEP__`，不会暴露内容或长度。
-- body 整体只写；已配置时只返回 `__KEEP__`。
-- URL 中所有查询参数值固定返回 `__KEEP__`，URL fragment 不返回；不要把密钥放在路径中。
+```json
+{
+  "ok": false,
+  "serverTime": 1787910000001,
+  "total": 2,
+  "succeeded": 1,
+  "failed": 1,
+  "results": [
+    {
+      "monitorId": "balance-a",
+      "monitorName": "主账户余额",
+      "ok": true,
+      "result": {"httpCode": 200, "rawValue": 60, "value": 1, "breached": true}
+    },
+    {
+      "monitorId": "balance-b",
+      "monitorName": "备用账户余额",
+      "ok": false,
+      "error": {"code": "monitor_test_failed", "message": "HTTP 503", "httpCode": 503}
+    }
+  ]
+}
+```
+
+批量结果不会包含 URL、header 或 body；手动刷新同样不会生成报警、累计自动检测错误或
+推迟下一次自动检测。
+
+复制请求体仅需 `{}`。服务端直接复制原始配置，因此 URL、
+header 和 body 中的密钥会完整保留。副本使用新的唯一 ID 和名称、
+`revision: 1`，默认停用并插入源监控项之后；名称依次使用 `原名（副本）`、
+`原名（副本2）`、`原名（副本3）` 并避开已有名称。
+
+重排请求体必须同时提交客户端读取到的旧顺序和目标顺序：
+
+```json
+{
+  "expectedMonitorIds": ["balance-a", "balance-b"],
+  "monitorIds": ["balance-b", "balance-a"]
+}
+```
+
+两个数组都必须包含该组全部且唯一的监控 ID。服务端在锁内确认
+`expectedMonitorIds` 仍与当前顺序完全一致，然后原子写入新顺序；其他组的存储槽位不会
+变化。配置已被另一客户端新增、删除或重排时返回 HTTP 409 和
+`order_conflict`，客户端应重新加载后再操作。成功响应的 `monitors` 是完整配置列表。
+管理配置和共享状态接口都按这个持久化顺序返回。
+
+管理员需要直接查看和编辑密钥，因此管理列表、创建、更新、复制和重排响应会返回完整原始
+URL、`headersJson` 和 body。只持有普通共享密钥的 `/api/v1/monitors` 仍返回脱敏 URL，
+并且不返回 header 或 body。安全规则如下：
+
+- 管理员响应包含业务接口密钥，必须使用 HTTPS，并且不要把 `ADMIN_TOKEN` 配置到普通客服端。
 - 上游请求异常只返回脱敏后的错误，不回传原始 URL、header 或 body 内容。
-- PUT 省略敏感字段，或原样提交 `__KEEP__`，表示保留原值。
+- 为兼容旧客户端，响应仍包含 `keepPlaceholder: "__KEEP__"`；PUT 省略敏感字段或提交
+  `__KEEP__` 仍表示保留原值。
 - PUT 提交 `body: null` 会明确清除已有请求体。
 - 每项返回 `revision` 和 `updatedAt`。PUT 可携带 `revision`；版本过期返回 HTTP 409，
   防止两个客户端互相覆盖配置。
@@ -251,7 +327,7 @@ GET/POST/PUT 返回 `keepPlaceholder: "__KEEP__"`。安全规则如下：
 | `ADMIN_TOKEN` | 空 | App 管理监控项的独立密钥 |
 | `RELAY_TOKEN` | 空 | 可选的所有组通用客户端密钥 |
 | `RELAY_CONFIG_FILE` | `config.json` | 基础配置文件 |
-| `RELAY_DATA_FILE` | `data/relay-state.json` | 持久事件文件；空字符串禁用持久化 |
+| `RELAY_DATA_FILE` | `data/relay-state.json` | 持久事件文件；空字符串会禁用持久化并使健康检查降级 |
 | `MONITOR_STORE_FILE` | `data/monitor-configs.json` | App 管理的监控配置文件 |
 | `HEARTBEAT_TIMEOUT_SECONDS` | `90` | 客户端在线判定时间 |
 | `EVENT_RETENTION_SECONDS` | `86400` | 事件保留时间 |
@@ -264,35 +340,50 @@ Python 进程的监听变量。
 
 ## 双客户端冒烟
 
-服务启动后，可用下面的命令先验证完整协议。把共享密钥改成 `config.json` 中该组的
+服务启动后，可用下面的命令先验证完整协议。把共享密钥改成 `config.json` 中的
 `sharedToken`；接收方应得到一条 `manual` 报警，发送方的 `alerts` 应为空。
+自动测试会先建立长轮询再发送，并对事件 UID、游标令牌和发送方排除做断言。测试会产生真实
+报警，不要在仍有值守客户端在线的生产服务上执行。
+
+```bash
+python3 smoke_test.py \
+  --url http://127.0.0.1:8047 \
+  --token '替换为共享密钥'
+```
+
+多组旧部署仍可额外传入 `--group customer-service`。
+
+需要逐步检查原始响应时，也可以使用以下 `curl` 命令：
 
 ```bash
 export RELAY_URL='http://127.0.0.1:8047'
-export RELAY_GROUP='customer-service'
-export RELAY_SHARED_TOKEN='替换为该组共享密钥'
+export RELAY_SHARED_TOKEN='替换为共享密钥'
 
-RECEIVER_CURSOR="$(curl -fsS -X POST "$RELAY_URL/api/v1/clients/register" \
+RECEIVER_REGISTRATION="$(curl -fsS -X POST "$RELAY_URL/api/v1/clients/register" \
   -H "Authorization: Bearer $RELAY_SHARED_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"groupId\":\"$RELAY_GROUP\",\"clientId\":\"smoke-receiver\",\"clientName\":\"接收测试端\"}" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["cursor"])')"
+  -d '{"clientId":"smoke-receiver"}')"
+RECEIVER_CURSOR="$(printf '%s' "$RECEIVER_REGISTRATION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["cursor"])')"
+RECEIVER_TOKEN="$(printf '%s' "$RECEIVER_REGISTRATION" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cursorToken") or "")')"
+RECEIVER_TOKEN_QUERY="${RECEIVER_TOKEN:+&afterToken=$RECEIVER_TOKEN}"
 
-SENDER_CURSOR="$(curl -fsS -X POST "$RELAY_URL/api/v1/clients/register" \
+SENDER_REGISTRATION="$(curl -fsS -X POST "$RELAY_URL/api/v1/clients/register" \
   -H "Authorization: Bearer $RELAY_SHARED_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"groupId\":\"$RELAY_GROUP\",\"clientId\":\"smoke-sender\",\"clientName\":\"发送测试端\"}" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["cursor"])')"
+  -d '{"clientId":"smoke-sender"}')"
+SENDER_CURSOR="$(printf '%s' "$SENDER_REGISTRATION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["cursor"])')"
+SENDER_TOKEN="$(printf '%s' "$SENDER_REGISTRATION" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("cursorToken") or "")')"
+SENDER_TOKEN_QUERY="${SENDER_TOKEN:+&afterToken=$SENDER_TOKEN}"
 
 curl -fsS -X POST "$RELAY_URL/api/v1/alerts" \
   -H "Authorization: Bearer $RELAY_SHARED_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"groupId\":\"$RELAY_GROUP\",\"senderId\":\"smoke-sender\",\"senderName\":\"发送测试端\",\"message\":\"值守报警冒烟测试\"}"
+  -d '{"senderId":"smoke-sender","message":"值守报警冒烟测试"}'
 
-curl -fsS "$RELAY_URL/api/v1/alerts?groupId=$RELAY_GROUP&clientId=smoke-receiver&after=$RECEIVER_CURSOR&wait=0" \
+curl -fsS "$RELAY_URL/api/v1/alerts?clientId=smoke-receiver&after=$RECEIVER_CURSOR$RECEIVER_TOKEN_QUERY&wait=0" \
   -H "Authorization: Bearer $RELAY_SHARED_TOKEN"
 
-curl -fsS "$RELAY_URL/api/v1/alerts?groupId=$RELAY_GROUP&clientId=smoke-sender&after=$SENDER_CURSOR&wait=0" \
+curl -fsS "$RELAY_URL/api/v1/alerts?clientId=smoke-sender&after=$SENDER_CURSOR$SENDER_TOKEN_QUERY&wait=0" \
   -H "Authorization: Bearer $RELAY_SHARED_TOKEN"
 ```
 
@@ -302,5 +393,7 @@ curl -fsS "$RELAY_URL/api/v1/alerts?groupId=$RELAY_GROUP&clientId=smoke-sender&a
 python3 -m unittest discover -s server/tests -v
 ```
 
-测试覆盖鉴权、长轮询唤醒、发送方排除、首次注册游标、重启后事件 ID、监控检测与自动
-报警、配置安全范围和首次导入，以及管理 API 的密钥不回显和掩码保留行为。
+测试覆盖鉴权、长轮询唤醒、发送方排除、游标令牌与旧备份回滚、重启后事件 ID、存储
+健康探测、配置热加载、监控检测与自动报警、配置安全范围和首次导入，以及管理 API 的
+管理员密钥回显隔离、服务端安全复制、单项及批量测试状态同步、部分失败隔离、冲突保护重排
+和顺序持久化行为。

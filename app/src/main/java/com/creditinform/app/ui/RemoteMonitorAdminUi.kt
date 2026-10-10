@@ -33,7 +33,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.creditinform.app.data.RemoteMonitorConfig
 import com.creditinform.app.data.RemoteMonitorUpsertRequest
@@ -70,8 +69,16 @@ fun RemoteMonitorEditorScreen(
         mutableStateOf(parseSecretObject(existing?.headersJson))
     }
     val bodyAlreadyConfigured = existing?.bodyConfigured == true
-    var bodyMode by remember(existing?.id) { mutableStateOf(RequestBodyDraftMode.KEEP) }
-    var body by remember(existing?.id) { mutableStateOf("") }
+    val initialBody = existing?.body
+        ?.takeUnless { it == RemoteMonitorConfig.KEEP_PLACEHOLDER }
+        .orEmpty()
+    var bodyMode by remember(existing?.id) {
+        mutableStateOf(
+            if (initialBody.isNotEmpty()) RequestBodyDraftMode.REPLACE
+            else RequestBodyDraftMode.KEEP
+        )
+    }
+    var body by remember(existing?.id) { mutableStateOf(initialBody) }
     var jsonPath by rememberSaveable(existing?.id) { mutableStateOf(existing?.jsonPath.orEmpty()) }
     var operator by rememberSaveable(existing?.id) { mutableStateOf(existing?.operator ?: "<") }
     var thresholdText by rememberSaveable(existing?.id) {
@@ -208,13 +215,6 @@ fun RemoteMonitorEditorScreen(
                         )
                     }
                 }
-                if (bodyAlreadyConfigured && bodyMode == RequestBodyDraftMode.KEEP) {
-                    Text(
-                        "请求体已配置，服务端不会回传其内容",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
                 if (bodyMode == RequestBodyDraftMode.CLEAR) {
                     Text(
                         "保存后将清除服务端请求体",
@@ -226,8 +226,7 @@ fun RemoteMonitorEditorScreen(
                     OutlinedTextField(
                         value = body,
                         onValueChange = { body = it },
-                        label = { Text("新请求体") },
-                        visualTransformation = PasswordVisualTransformation(),
+                        label = { Text("请求体") },
                         minLines = 3,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -409,7 +408,6 @@ fun RemoteMonitorEditorScreen(
                     if (validationError.isEmpty()) {
                         val requestUrl = buildMonitorUrl(
                             baseUrl = urlBase,
-                            existingUrl = existing?.url,
                             queryFields = queryFields
                         )
                         onSave(
@@ -502,7 +500,6 @@ private fun SecretFieldList(
                             if (field.keepExisting) "已配置，留空则保留" else "请输入值"
                         )
                     },
-                    visualTransformation = PasswordVisualTransformation(),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -587,7 +584,10 @@ private fun splitMonitorUrl(value: String): InitialUrl {
     if (value.isBlank()) return InitialUrl("", emptyList())
     return runCatching {
         val uri = URI(value.trim())
-        val base = URI(uri.scheme, null, uri.host, uri.port, uri.path, null, null).toString()
+        val base = buildString {
+            append(uri.scheme).append("://").append(uri.rawAuthority)
+            append(uri.rawPath.orEmpty())
+        }
         val fields = uri.rawQuery.orEmpty()
             .split('&')
             .filter(String::isNotBlank)
@@ -613,13 +613,13 @@ private fun parseSecretObject(value: String?): List<SecretFieldDraft> {
     return runCatching {
         val json = JSONObject(value)
         json.keys().asSequence().mapIndexed { index, name ->
-            // The server contract masks every returned header. Never put an unexpected value in UI.
+            val rawValue = json.get(name).toString()
             SecretFieldDraft(
                 id = System.nanoTime() + index,
                 originalName = name,
                 name = name,
-                value = "",
-                keepExisting = true
+                value = rawValue.takeUnless { it == RemoteMonitorConfig.KEEP_PLACEHOLDER }.orEmpty(),
+                keepExisting = rawValue == RemoteMonitorConfig.KEEP_PLACEHOLDER
             )
         }.toList()
     }.getOrDefault(emptyList())
@@ -637,20 +637,9 @@ private fun secretFieldsToJson(fields: List<SecretFieldDraft>): String = JSONObj
 
 private fun buildMonitorUrl(
     baseUrl: String,
-    existingUrl: String?,
     queryFields: List<SecretFieldDraft>
 ): String {
-    var base = baseUrl.trim().trimEnd('?')
-    val previous = existingUrl?.let { runCatching { URI(it) }.getOrNull() }
-    val current = runCatching { URI(base) }.getOrNull()
-    if (previous?.rawUserInfo == RemoteMonitorConfig.KEEP_PLACEHOLDER && current?.rawUserInfo == null) {
-        base = buildString {
-            append(current?.scheme).append("://")
-            append(RemoteMonitorConfig.KEEP_PLACEHOLDER).append('@')
-            append(current?.rawAuthority)
-            append(current?.rawPath.orEmpty())
-        }
-    }
+    val base = baseUrl.trim().trimEnd('?')
     val query = queryFields.joinToString("&") { field ->
         val value = field.value.takeIf { it.isNotBlank() }
             ?: RemoteMonitorConfig.KEEP_PLACEHOLDER
