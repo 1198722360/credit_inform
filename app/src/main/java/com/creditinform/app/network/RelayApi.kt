@@ -477,7 +477,10 @@ class RelayApi {
             timeoutSeconds = optInt("timeoutSeconds", 15),
             errorThreshold = optInt("errorThreshold", 3),
             repeatAlertSeconds = optLong("repeatAlertSeconds", 300),
-            enabled = optBoolean("enabled", true)
+            enabled = optBoolean("enabled", true),
+            provider = optString("provider", "http"),
+            gatewayAccessKey = optString("gatewayAccessKey"),
+            gatewaySecretKeyEnv = optString("gatewaySecretKeyEnv", "GATEWAY_SK")
         )
     }
 
@@ -501,6 +504,9 @@ class RelayApi {
         put("name", name)
         put("url", url)
         put("method", method)
+        put("provider", provider)
+        put("gatewayAccessKey", gatewayAccessKey)
+        put("gatewaySecretKeyEnv", gatewaySecretKeyEnv)
         headersJson?.let { put("headersJson", it) }
         if (bodySpecified) put("body", body ?: JSONObject.NULL)
         put("jsonPath", jsonPath)

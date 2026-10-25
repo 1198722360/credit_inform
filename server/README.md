@@ -6,7 +6,7 @@
 - 在服务端集中轮询业务接口，并将余额越界或连续检测失败广播给客户端。
 
 Android App 只需配置本服务的地址和共享密钥，不需要填写通信组，也不需要保存业务接口的密钥。
-服务只使用 Python 标准库，不需要安装第三方包。
+普通 HTTP 监控只使用 Python 标准库；GateWay 加密接口需要 `cryptography`，Docker 镜像会自动安装。
 
 ## 快速启动
 
@@ -14,6 +14,7 @@ Android App 只需配置本服务的地址和共享密钥，不需要填写通�
 
 ```bash
 cd server
+python3 -m pip install -r requirements.txt
 cp config.example.json config.json
 # 修改共享密钥和初始监控项后启动
 ADMIN_TOKEN='另一个独立的长随机密钥' python3 relay_server.py
@@ -121,6 +122,70 @@ Compose 默认只绑定 `127.0.0.1:8047`，适合由同机反向代理提供 HTT
 `config.json` 中的初始监控项不会覆盖 App 已管理的数据。内部组和共享密钥仍会自动热加载，
 管理数据文件被外部原子替换时也会热加载。默认每 2 秒检查一次文件变化。
 示例监控默认关闭；在 App 中先执行一次“测试”，确认取值和换算正确后再启用。
+
+## GateWay 加密接口
+
+已按《接入文档 · GateWay.pdf》接入 HKDF-SHA256 和 AES-256-GCM。每次调用自动生成新的
+nonce、时间戳和 IV，响应解密绑定本次请求 nonce；所有认证和 SK 的读取都在服务端完成。
+网页和 App 的新增/编辑监控界面都可选择“GateWay”。
+
+先在服务器上设置环境变量 `GATEWAY_SK=gwsk_...`。使用 Docker Compose 时，在
+`server/.env` 中增加这一行，然后执行 `docker compose up -d --build`，使新进程载入 SK。
+SK 从 GateWay 控制台的 API 凭证页取得；不要在 App、网页、请求头或请求体里填写 SK。
+
+在网页或 App 新建监控，选择 GateWay 后填写：
+
+| 配置 | 余额查询填写值 |
+| --- | --- |
+| 接口地址 | `https://op.privapi.cc/open/v1/balance/query` |
+| Access Key（AK） | API 凭证页中的 `gwak_` 加 24 位十六进制字符 |
+| 服务器 SK 环境变量名 | `GATEWAY_SK`（填写名称，不是密钥值） |
+| 请求体 / 业务参数 | 留空或 `{}` |
+| JSON 字段路径 | `data.balance` |
+| 倍率 / 偏移量 | `1` / `0`，金额单位为美元 |
+| 检测间隔 | 默认 60 秒，最少 30 秒 |
+| 报警值 | 按所需的美元余额填写，例如低于 `10` |
+
+先保存并测试，确认读数后启用。凭证需要勾选 `balance:read`。服务端也支持文档中的
+`/open/v1/nodes/query`、`/open/v1/logs/query`、`/open/v1/bans/query` 加密传输；
+监控时仍需选择返回值中的数值字段，例如 `data.items[0].quota.five_hour_utilization`。
+这些接口需要各自的权限；分页参数需在业务参数中配置，监控只读取指定页。
+推送在文档中尚未开放，本实现使用轮询。
+
+基础配置文件示例见 `config.gateway.example.json`。首次部署可复制该文件，并替换共享密钥和 AK。
+已有部署请通过网页或 App 新建，或使用管理 API：
+
+```json
+{
+  "name": "GateWay 余额（美元）",
+  "provider": "gateway",
+  "url": "https://op.privapi.cc/open/v1/balance/query",
+  "method": "POST",
+  "gatewayAccessKey": "gwak_你的24位十六进制AK",
+  "gatewaySecretKeyEnv": "GATEWAY_SK",
+  "headersJson": "{}",
+  "body": {},
+  "jsonPath": "data.balance",
+  "operator": "<",
+  "threshold": 10,
+  "multiplier": 1,
+  "offset": 0,
+  "pollIntervalSeconds": 60,
+  "enabled": false
+}
+```
+
+`provider` 省略时仍为普通 HTTP；请求头由 GateWay 适配器自动生成，配置中应留空。
+URL 必须使用 HTTPS 和完整接口路径，不带查询串、fragment、用户信息或结尾斜杠。
+业务参数必须是 JSON 对象，最终加密信封不得超过 32 KiB。金额使用 `Decimal` 解析、换算
+和阈值比较，只有返回给现有客户端的显示读数转为 JSON number；GateWay 的 `=` 是精确十进制比较。
+
+认证错误和加密业务错误会显示安全的错误码、HTTP 状态和合法的 `request_id`，不会回传
+上游原始错误正文；连续失败仍按既有规则报警。限流返回 `Retry-After` 时，自动检测会相应延后
+（最长等待一天），不会立即自动重试。服务器时间应保持同步，凭证 IP 白名单应包含服务器出口 IP。
+
+多个凭证可分别使用不同的环境变量名。Compose 默认只注入 `GATEWAY_SK`；其他变量需自行在
+`compose.yaml` 的 `environment` 中映射。重置 SK 后更新服务器环境变量并重建/重启进程。
 
 ## 报警策略
 
@@ -230,6 +295,20 @@ GET /api/v1/alerts?clientId=device-b&after=123&afterToken=62bb73f844af48cfb2c640
 `cursorValid:true`，并返回新 `cursor` 对应的 `cursorToken`。未提供 `afterToken` 的旧客户端
 仍可使用接口，但无法检测“备份回滚后事件编号恰好追平”这一情况。
 
+## 网页管理
+
+浏览器打开服务端根地址（例如 `http://服务器:8047/`），用 `ADMIN_TOKEN` 登录，即可
+新建、编辑、测试、复制、删除和排序监控，并查看每个监控的最新读数。网页调用的就是下面的
+监控配置 API，和 App 里的修改实时互通；同一监控在两处同时修改时，后保存的一方会收到冲突
+提示并载入最新配置。
+
+页面由 `admin_web.html` 提供，只允许运行它自带的脚本，不加载任何外部资源。管理员密钥
+默认只保存在当前浏览器标签页，勾选“记住密钥”才会长期保存在这台电脑上。明文 HTTP
+部署下，密钥会以明文经过网络，请只在可信网络里使用，或在前面加 HTTPS 反向代理。
+
+`GET /api/v1/admin/monitors` 的响应额外包含 `statuses`（与 `/api/v1/monitors`
+相同的脱敏实时状态），供网页显示读数。
+
 ## App 监控配置 API
 
 这些端点只接受 `Authorization: Bearer <ADMIN_TOKEN>`。普通 `sharedToken` 或
@@ -326,6 +405,7 @@ URL、`headersJson` 和 body。只持有普通共享密钥的 `/api/v1/monitors`
 | `PORT` | `8047` | 监听端口 |
 | `ADMIN_TOKEN` | 空 | App 管理监控项的独立密钥 |
 | `RELAY_TOKEN` | 空 | 可选的所有组通用客户端密钥 |
+| `GATEWAY_SK` | 空 | GateWay 服务器 SK；可由监控项的 `gatewaySecretKeyEnv` 指定其他环境变量 |
 | `RELAY_CONFIG_FILE` | `config.json` | 基础配置文件 |
 | `RELAY_DATA_FILE` | `data/relay-state.json` | 持久事件文件；空字符串会禁用持久化并使健康检查降级 |
 | `MONITOR_STORE_FILE` | `data/monitor-configs.json` | App 管理的监控配置文件 |
@@ -397,3 +477,7 @@ python3 -m unittest discover -s server/tests -v
 健康探测、配置热加载、监控检测与自动报警、配置安全范围和首次导入，以及管理 API 的
 管理员密钥回显隔离、服务端安全复制、单项及批量测试状态同步、部分失败隔离、冲突保护重排
 和顺序持久化行为。
+
+GateWay 测试使用官方公开的合成凭证和固定向量，核对密钥派生、请求密文和响应明文；
+还覆盖错误密钥/AAD、响应重放、明文及加密错误、请求大小、限流等待、十进制边界、
+配置持久化和自动余额报警。测试不调用真实业务接口。

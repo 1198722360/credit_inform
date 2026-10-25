@@ -90,16 +90,25 @@ object AlarmController {
         }
     }
 
+    /** Silences every alert and marks all received relay events as read. */
     @Synchronized
     fun dismissAll(context: Context) {
-        val manager = context.getSystemService(NotificationManager::class.java)
-        activeAlerts.keys.forEach { alertId ->
-            manager.cancel(alertId, ALERT_NOTIFICATION_ID)
-            manager.cancel(legacyNotificationId(alertId))
+        val appContext = context.applicationContext
+        val manager = appContext.getSystemService(NotificationManager::class.java)
+        activeAlerts.keys.forEach { alertId -> cancelNotification(appContext, alertId) }
+        // Alert notifications left behind by a previous process are not in activeAlerts.
+        runCatching {
+            manager.activeNotifications
+                .filter { it.id == ALERT_NOTIFICATION_ID && it.tag != null }
+                .forEach { manager.cancel(it.tag, it.id) }
         }
         activeAlerts.clear()
-        stopOutputsAndRestore(context.applicationContext)
+        RelayRepository.get(appContext).acknowledgeAllLocally()
+        stopOutputsAndRestore(appContext)
     }
+
+    @Synchronized
+    fun isActive(alertId: String): Boolean = alertId in activeAlerts
 
     /** Restores settings left changed if the previous app process was killed during an alert. */
     @Synchronized

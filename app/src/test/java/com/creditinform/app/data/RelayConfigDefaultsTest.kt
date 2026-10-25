@@ -12,12 +12,28 @@ class RelayConfigDefaultsTest {
     fun `fresh install has usable relay defaults`() {
         val config = RelayConfig.freshInstall()
 
-        assertEquals("http://15.204.246.22:8047", config.serverUrl)
+        assertEquals("http://70.39.195.177:8047", config.serverUrl)
         assertTrue(config.sharedToken.isNotBlank())
         assertEquals("customer-service", config.groupId)
         assertEquals("Android 客户端", config.deviceName)
         assertFalse(config.enabled)
         assertTrue(config.isComplete)
+    }
+
+    @Test
+    fun `saved configs on the retired default server move to the new default`() {
+        assertEquals(
+            RelayConfig.DEFAULT_SERVER_URL,
+            RelayConfig.migrateServerUrl("http://15.204.246.22:8047")
+        )
+        assertEquals(
+            RelayConfig.DEFAULT_SERVER_URL,
+            RelayConfig.migrateServerUrl(" http://15.204.246.22:8047/ ")
+        )
+        assertEquals(
+            "https://relay.example.test",
+            RelayConfig.migrateServerUrl("https://relay.example.test")
+        )
     }
 
     @Test

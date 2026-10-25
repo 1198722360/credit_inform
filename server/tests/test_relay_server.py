@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import sys
 import tempfile
@@ -262,6 +264,46 @@ class RelayServerTest(unittest.TestCase):
         self.assertEqual(sent["alert"]["eventUid"], relay_status["cursorToken"])
         self.assertEqual(event_id, relay_status["headCursor"])
         self.assertEqual(sent["alert"]["eventUid"], relay_status["headEventUid"])
+
+    def test_admin_page_is_served_with_a_hash_locked_policy(self) -> None:
+        for path in ("/", "/admin"):
+            with self.subTest(path=path):
+                with urllib.request.urlopen(self.base_url + path, timeout=5) as response:
+                    self.assertEqual(200, response.status)
+                    self.assertTrue(response.headers["Content-Type"].startswith("text/html"))
+                    policy = response.headers["Content-Security-Policy"]
+                    page = response.read().decode("utf-8")
+                self.assertIn("default-src 'none'", policy)
+                self.assertIn("connect-src 'self'", policy)
+                self.assertNotIn("unsafe-inline", policy)
+                self.assertEqual("DENY", response.headers["X-Frame-Options"])
+                self.assertNotIn("\r", page)
+                for tag in ("script", "style"):
+                    inline = page.split(f"<{tag}>", 1)[1].split(f"</{tag}>", 1)[0]
+                    digest = base64.b64encode(
+                        hashlib.sha256(inline.encode("utf-8")).digest()
+                    ).decode("ascii")
+                    self.assertIn(f"'sha256-{digest}'", policy)
+                # The page must not embed any secret; it only learns them after login.
+                self.assertNotIn(ADMIN_TOKEN, page)
+                self.assertNotIn(GROUP_TOKEN, page)
+
+    def test_admin_listing_includes_live_statuses(self) -> None:
+        status, created = self.request(
+            "POST",
+            "/api/v1/admin/monitors",
+            self.monitor_request("live", "Live", enabled=False),
+            ADMIN_TOKEN,
+        )
+        self.assertEqual(201, status)
+        status, listed = self.request(
+            "GET", "/api/v1/admin/monitors", token=ADMIN_TOKEN
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(["live"], [item["id"] for item in listed["monitors"]])
+        self.assertEqual(["live"], [item["id"] for item in listed["statuses"]])
+        self.assertIn("lastValue", listed["statuses"][0])
+        self.assertIn("nextCheckAt", listed["statuses"][0])
 
     def test_single_group_api_can_omit_group_and_client_names(self) -> None:
         status, receiver = self.request(

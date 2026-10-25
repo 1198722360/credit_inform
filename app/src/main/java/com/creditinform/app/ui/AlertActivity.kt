@@ -57,7 +57,6 @@ class AlertActivity : ComponentActivity() {
     }
 
     private fun render(alertIntent: Intent) {
-        val alertId = alertIntent.getStringExtra(EXTRA_ALERT_ID).orEmpty()
         val title = alertIntent.getStringExtra(EXTRA_TITLE).orEmpty()
         val message = alertIntent.getStringExtra(EXTRA_MESSAGE).orEmpty()
         val detail = alertIntent.getStringExtra(EXTRA_DETAIL).orEmpty()
@@ -71,7 +70,7 @@ class AlertActivity : ComponentActivity() {
                     detail = detail,
                     prominentText = prominentText,
                     onDismiss = {
-                        AlarmController.dismiss(this, alertId)
+                        AlarmController.dismissAll(this)
                         finishAndRemoveTask()
                     }
                 )

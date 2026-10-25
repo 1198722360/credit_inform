@@ -1,0 +1,1789 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>值守报警监控配置</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --enamel: #d3d8d2;
+  --bezel: #2d3437;
+  --glass: #e8ebe5;
+  --paper: #f5f6f2;
+  --ink: #2d3437;
+  --ink-soft: #4f585c;
+  --rule: #b7beb8;
+  --field-line: #a3aba5;
+  --alarm: #c42f27;
+  --alarm-text: #a8241d;
+  --fault: #efa21b;
+  --fault-ink: #2b1d00;
+  --signal: #1d5fa6;
+  --cjk: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "Source Han Sans SC", system-ui, sans-serif;
+  --din: Bahnschrift, "DIN Alternate", "DIN Condensed", "Roboto Condensed", "Arial Narrow", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --code: ui-monospace, "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--enamel);
+  color: var(--ink);
+  font: 15px/1.6 var(--cjk);
+}
+[hidden] { display: none !important; }
+:focus-visible { outline: 3px solid var(--signal); outline-offset: 2px; }
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* Buttons and fields */
+.button {
+  display: inline-flex; align-items: center; justify-content: center;
+  height: 38px; padding: 0 16px;
+  border: 1px solid #929b95; border-radius: 4px;
+  background: transparent; color: var(--ink);
+  font: inherit; font-size: 15px; line-height: 1; white-space: nowrap;
+  cursor: pointer;
+}
+.button:hover { background-color: rgba(45, 52, 55, .07); }
+.button.primary { border-color: var(--bezel); background: var(--bezel); color: #f5f6f2; }
+.button.primary:hover { background: #3a4347; }
+.button.quiet { border-color: transparent; }
+.button.danger { border-color: var(--alarm); background: var(--alarm); color: #fff; }
+.button.danger:hover { background: #ad271f; }
+.button.danger-text { border-color: transparent; color: var(--alarm-text); }
+.button.small { height: 32px; padding: 0 10px; font-size: 14px; }
+.button.wide { width: 100%; }
+.button:disabled { opacity: .5; cursor: default; }
+.button:disabled:hover { background-color: transparent; }
+.button.primary:disabled:hover { background: var(--bezel); }
+
+.input {
+  width: 100%; min-height: 40px; padding: 8px 10px;
+  border: 1px solid var(--field-line); border-radius: 4px;
+  background: #fff; color: var(--ink);
+  font: inherit;
+}
+.input:focus-visible { outline-width: 2px; outline-offset: 1px; }
+.input[aria-invalid="true"] { border-color: var(--alarm); }
+.input.fit { width: auto; }
+textarea.input { min-height: 104px; resize: vertical; font-family: var(--code); font-size: 14px; line-height: 1.5; }
+.field { margin: 0 0 14px; }
+.field > label, .field-label { display: block; margin: 0 0 4px; font-size: 14px; font-weight: 600; }
+.hint { margin: 4px 0 0; font-size: 13px; color: var(--ink-soft); }
+.field-error { margin: 4px 0 0; font-size: 13px; color: var(--alarm-text); }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 12px; }
+.check { display: flex; align-items: center; gap: 8px; margin: 0 0 16px; font-size: 14px; cursor: pointer; }
+.check input { width: 16px; height: 16px; margin: 0; accent-color: var(--bezel); }
+
+/* Login */
+.login { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; }
+.login-card {
+  width: min(400px, 100%); padding: 28px 28px 24px;
+  border: 1px solid var(--rule); border-radius: 8px; background: var(--paper);
+}
+.login-card h1 { margin: 0 0 6px; font-size: 22px; line-height: 1.3; font-weight: 600; }
+.login-card .hint { margin: 0 0 20px; }
+.login-warning { margin: 16px 0 0; font-size: 13px; color: var(--ink-soft); }
+
+/* Page shell */
+.shell { max-width: 1240px; margin: 0 auto; padding: 28px 32px 56px; }
+.masthead { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px 24px; margin: 0 0 22px; }
+.masthead h1 { margin: 0; font-size: 26px; line-height: 1.25; font-weight: 600; letter-spacing: .02em; }
+.masthead-sub { margin: 2px 0 0; font-size: 13px; color: var(--ink-soft); }
+.masthead-status { margin: 0 0 0 auto; font-size: 14px; }
+.masthead-status.is-degraded { color: var(--alarm-text); font-weight: 600; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 0 0 12px; }
+.toolbar-group { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.toolbar-hint { font-size: 13px; color: var(--ink-soft); }
+.toolbar-meta { margin-left: auto; font-size: 13px; color: var(--ink-soft); }
+.toolbar-meta.is-error { color: var(--alarm-text); font-weight: 600; }
+
+/* Annunciator panel: each monitor is one window, lit only when it needs attention. */
+.panel {
+  padding: 8px; border-radius: 10px; background: var(--bezel);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .07), 0 1px 0 rgba(255, 255, 255, .55);
+}
+.panel :focus-visible { outline-color: #9ccbff; }
+.panel-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 6px; }
+.panel-empty { margin: 0; padding: 44px 20px; color: #c9d0d1; text-align: center; }
+.window {
+  position: relative;
+  display: flex; flex-direction: column; gap: 2px;
+  min-height: 150px; padding: 14px 16px 12px;
+  border: 0; border-radius: 3px;
+  background: var(--glass); color: var(--ink);
+  font: inherit; text-align: left;
+}
+button.window { width: 100%; cursor: pointer; }
+button.window.is-normal:hover, button.window.is-pending:hover { background: #f1f3ee; }
+button.window.is-off:hover { background: #434c4f; }
+.window-name { font-family: var(--din); font-size: 16px; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+.window-value {
+  margin-top: auto; padding-top: 10px;
+  font-family: var(--din); font-size: 32px; line-height: 1.1;
+  font-variant-numeric: tabular-nums; letter-spacing: .01em;
+  overflow-wrap: anywhere;
+}
+.window-rule { font-size: 14px; }
+.window-meta {
+  font-size: 13px; color: var(--ink-soft);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.window.is-pending .window-value { color: var(--ink-soft); }
+.window.is-alarm { background: radial-gradient(120% 90% at 50% 35%, #cc342b, #b82a22); color: #fff; }
+.window.is-alarm .window-meta { color: #fff; }
+.window.is-fault { background: radial-gradient(120% 90% at 50% 35%, #f3ab2a, #e69a12); color: var(--fault-ink); }
+.window.is-fault .window-meta { color: var(--fault-ink); }
+.window.is-off { background: #3a4245; color: #b0b8ba; }
+.window.is-off .window-meta { color: #b0b8ba; }
+.window-sort { display: flex; gap: 6px; margin-top: 10px; }
+.window-sort .button { background: rgba(255, 255, 255, .72); border-color: rgba(45, 52, 55, .35); color: var(--ink); }
+.window-sort .button:hover { background: #fff; }
+@media (prefers-reduced-motion: no-preference) {
+  .window.is-alarm { animation: lamp 2.4s ease-in-out infinite; }
+}
+@keyframes lamp { 50% { filter: brightness(1.06); } }
+
+/* Editor drawer */
+dialog.drawer {
+  position: fixed; inset: 0 0 0 auto;
+  width: min(560px, 100%); max-width: 100%; height: 100%; max-height: 100%;
+  margin: 0; padding: 0; border: 0; overflow: hidden;
+  background: var(--paper); color: var(--ink);
+  box-shadow: -16px 0 40px rgba(29, 35, 37, .28);
+}
+dialog.drawer[open] { display: flex; }
+dialog::backdrop { background: rgba(35, 42, 44, .5); }
+@media (prefers-reduced-motion: no-preference) {
+  dialog.drawer[open] { animation: drawer-in .2s ease-out; }
+}
+@keyframes drawer-in { from { transform: translateX(32px); opacity: 0; } }
+.drawer-form { display: flex; flex-direction: column; width: 100%; min-height: 0; }
+.drawer-head { display: flex; align-items: center; gap: 12px; padding: 18px 24px 14px; border-bottom: 1px solid var(--rule); }
+.drawer-head h2 { flex: 1; min-width: 0; margin: 0; font-size: 20px; line-height: 1.35; font-weight: 600; overflow-wrap: anywhere; }
+.drawer-body { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 24px 28px; }
+.drawer-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 14px 24px; border-top: 1px solid var(--rule); }
+.drawer-foot .spacer { flex: 1; }
+.drawer-status { font-size: 13px; color: var(--ink-soft); }
+.form-section { margin: 0 0 30px; }
+.form-section > h3 { margin: 0 0 12px; font-size: 17px; line-height: 1.4; font-weight: 600; }
+.notice { margin: 0 0 16px; padding: 10px 12px; border-left: 3px solid var(--signal); background: #e8eef5; font-size: 14px; overflow-wrap: anywhere; }
+.notice.is-error { border-left-color: var(--alarm); background: #f8e9e7; color: var(--alarm-text); }
+.readout { margin: 0 0 26px; }
+.readout-caption { margin: 0 0 6px; font-size: 13px; color: var(--ink-soft); }
+.readout-panel { padding: 6px; border-radius: 8px; background: var(--bezel); }
+.readout .window { min-height: 0; padding: 12px 14px; }
+.readout-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+.readout .window-value { margin: 0; padding: 0; font-size: 30px; }
+.readout .window-meta { display: block; -webkit-line-clamp: unset; }
+.segmented { display: inline-flex; border: 1px solid var(--field-line); border-radius: 4px; overflow: hidden; background: #fff; }
+.segmented label { position: relative; }
+.segmented input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.segmented span { display: block; padding: 7px 20px; font-family: var(--din); font-size: 15px; }
+.segmented label + label span { border-left: 1px solid var(--field-line); }
+.segmented input:checked + span { background: var(--bezel); color: #fff; }
+.segmented input:focus-visible + span { outline: 3px solid var(--signal); outline-offset: -3px; }
+.header-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) auto auto; gap: 6px; margin: 0 0 6px; }
+.rule-sentence { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.rule-sentence .input[type="text"] { width: 9.5em; }
+.preview { margin: 6px 0 0; font-size: 14px; color: var(--ink-soft); }
+.preview.is-breached { color: var(--alarm-text); }
+.sample { margin: 6px 0 14px; font-size: 14px; }
+.sample summary { width: fit-content; color: var(--signal); cursor: pointer; }
+.sample-body { margin-top: 10px; padding: 12px 12px 4px; border: 1px solid var(--rule); border-radius: 4px; }
+.switch { position: relative; display: inline-flex; align-items: center; gap: 10px; font-weight: 600; cursor: pointer; }
+.switch input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.switch-track { position: relative; flex: none; width: 44px; height: 24px; border-radius: 12px; background: #9aa39d; }
+.switch-track::after {
+  content: ""; position: absolute; top: 3px; left: 3px;
+  width: 18px; height: 18px; border-radius: 50%; background: #fff;
+  transition: transform .15s ease-out;
+}
+.switch input:checked + .switch-track { background: var(--bezel); }
+.switch input:checked + .switch-track::after { transform: translateX(20px); }
+.switch input:focus-visible + .switch-track { outline: 3px solid var(--signal); outline-offset: 2px; }
+
+/* Confirm dialog and toast */
+dialog.confirm {
+  width: min(420px, calc(100% - 32px)); padding: 22px 24px 18px;
+  border: 0; border-radius: 8px; background: var(--paper); color: var(--ink);
+  box-shadow: 0 20px 48px rgba(29, 35, 37, .3);
+}
+dialog.confirm h2 { margin: 0 0 8px; font-size: 18px; line-height: 1.4; font-weight: 600; overflow-wrap: anywhere; }
+dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.toast {
+  position: fixed; left: 50%; bottom: 24px; z-index: 10;
+  max-width: min(560px, calc(100% - 32px)); padding: 10px 16px;
+  border-radius: 6px; background: var(--bezel); color: #f5f6f2;
+  font-size: 14px; transform: translateX(-50%);
+  visibility: hidden;
+}
+.toast.is-visible { visibility: visible; }
+.toast.is-error { background: #8f1f19; }
+
+@media (max-width: 640px) {
+  .shell { padding: 18px 14px 40px; }
+  .masthead { align-items: flex-start; }
+  .masthead h1 { font-size: 22px; }
+  .masthead-status { order: 1; width: 100%; margin: 0; }
+  #logout-button { margin-left: auto; }
+  .toolbar-meta { margin-left: 0; width: 100%; }
+  .panel { padding: 6px; }
+  .panel-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 5px; }
+  .window { min-height: 128px; padding: 12px 12px 10px; }
+  .window-value { font-size: 26px; }
+  .drawer-head, .drawer-foot { padding-left: 16px; padding-right: 16px; }
+  .drawer-body { padding: 16px 16px 24px; }
+  .row { grid-template-columns: minmax(0, 1fr); }
+  .header-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+  .header-row [data-role="name"] { grid-column: 1 / -1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .switch-track::after { transition: none; }
+}
+</style>
+</head>
+<body>
+<noscript><p class="login">这个页面需要启用 JavaScript。</p></noscript>
+
+<main class="login" id="login-view" hidden>
+  <form class="login-card" id="login-form" novalidate>
+    <h1>值守报警监控配置</h1>
+    <p class="hint">用服务端的管理员密钥登录，和手机 App“连接配置”里填的管理员密钥相同。</p>
+    <div class="field">
+      <label for="login-token">管理员密钥</label>
+      <input class="input" id="login-token" type="password" autocomplete="current-password" spellcheck="false" aria-describedby="login-error">
+    </div>
+    <label class="check"><input type="checkbox" id="login-remember">在这台电脑上记住密钥</label>
+    <p class="field-error" id="login-error" hidden></p>
+    <button class="button primary wide" type="submit" id="login-submit">登录</button>
+    <p class="login-warning" id="login-warning" hidden>当前连接没有加密，密钥会以明文经过网络。请只在可信的网络里使用。</p>
+  </form>
+</main>
+
+<div class="shell" id="app-view" hidden>
+  <header class="masthead">
+    <div>
+      <h1>监控配置</h1>
+      <p class="masthead-sub" id="server-meta">值守报警服务端</p>
+    </div>
+    <p class="masthead-status" id="server-status"></p>
+    <button type="button" class="button quiet" id="logout-button">退出登录</button>
+  </header>
+
+  <div class="toolbar">
+    <div class="toolbar-group" id="toolbar-main">
+      <button type="button" class="button primary" id="create-button">新建监控</button>
+      <button type="button" class="button" id="refresh-button">立即检测全部</button>
+      <button type="button" class="button" id="sort-button">调整顺序</button>
+    </div>
+    <div class="toolbar-group" id="toolbar-sort" hidden>
+      <button type="button" class="button primary" id="sort-save">保存顺序</button>
+      <button type="button" class="button" id="sort-cancel">取消</button>
+      <span class="toolbar-hint">用每格里的“前移”“后移”调整，手机上的列表顺序会一起改变。</span>
+    </div>
+    <span class="toolbar-meta" id="sync-status"></span>
+  </div>
+
+  <section class="panel" aria-label="监控列表">
+    <div class="panel-grid" id="monitor-grid"></div>
+    <p class="panel-empty" id="panel-empty">正在载入监控…</p>
+  </section>
+</div>
+
+<dialog class="drawer" id="editor" aria-labelledby="editor-title">
+  <form class="drawer-form" id="editor-form" novalidate>
+    <header class="drawer-head">
+      <h2 id="editor-title">编辑监控</h2>
+      <button type="button" class="button quiet" id="editor-close">关闭</button>
+    </header>
+
+    <div class="drawer-body" id="editor-body">
+      <p class="notice" id="editor-message" hidden></p>
+
+      <div class="readout" id="readout" hidden>
+        <p class="readout-caption">服务端当前读数</p>
+        <div class="readout-panel">
+          <div class="window" id="readout-window">
+            <div class="readout-line">
+              <span class="window-value" id="readout-value"></span>
+              <span class="window-rule" id="readout-state"></span>
+            </div>
+            <span class="window-meta" id="readout-meta"></span>
+          </div>
+        </div>
+      </div>
+      <p class="notice" id="test-result" hidden></p>
+
+      <section class="form-section" aria-labelledby="section-request">
+        <h3 id="section-request">接口</h3>
+        <div class="field">
+          <label for="f-provider">接口类型</label>
+          <select class="input" id="f-provider">
+            <option value="http">普通 HTTP</option>
+            <option value="gateway">GateWay 加密接口</option>
+          </select>
+        </div>
+        <div id="gateway-fields" hidden>
+          <div class="field">
+            <label for="f-gateway-ak">Access Key（AK）</label>
+            <input class="input" id="f-gateway-ak" type="text" autocomplete="off" spellcheck="false" placeholder="gwak_…" aria-describedby="e-gateway-ak">
+            <p class="field-error" id="e-gateway-ak" hidden></p>
+          </div>
+          <div class="field">
+            <label for="f-gateway-sk-env">服务器 SK 环境变量名</label>
+            <input class="input" id="f-gateway-sk-env" type="text" autocomplete="off" spellcheck="false" placeholder="GATEWAY_SK" aria-describedby="h-gateway e-gateway-sk-env">
+            <p class="field-error" id="e-gateway-sk-env" hidden></p>
+            <p class="hint" id="h-gateway">SK 的值只在服务器环境变量中设置。服务端自动加密请求和解密响应；余额字段为 data.balance，单位为美元，倍率填 1，检测间隔至少 30 秒。</p>
+          </div>
+        </div>
+        <div class="field">
+          <label for="f-name">名称</label>
+          <input class="input" id="f-name" type="text" maxlength="128" autocomplete="off" placeholder="例如：主账号余额" aria-describedby="e-name">
+          <p class="field-error" id="e-name" hidden></p>
+        </div>
+        <div class="field">
+          <label for="f-url">接口地址</label>
+          <input class="input" id="f-url" type="url" autocomplete="off" spellcheck="false" placeholder="https://example.com/api/balance" aria-describedby="e-url">
+          <p class="field-error" id="e-url" hidden></p>
+        </div>
+        <div class="field" id="method-field">
+          <span class="field-label" id="method-label">请求方式</span>
+          <div class="segmented" role="radiogroup" aria-labelledby="method-label">
+            <label><input type="radio" name="method" value="GET"><span>GET</span></label>
+            <label><input type="radio" name="method" value="POST"><span>POST</span></label>
+          </div>
+        </div>
+        <div class="field" id="headers-field">
+          <span class="field-label" id="headers-label">请求头</span>
+          <div id="header-rows" role="group" aria-labelledby="headers-label" aria-describedby="e-headers"></div>
+          <button type="button" class="button small" id="add-header">添加请求头</button>
+          <p class="field-error" id="e-headers" hidden></p>
+        </div>
+        <div class="field" id="body-field" hidden>
+          <label for="f-body">请求体</label>
+          <textarea class="input" id="f-body" spellcheck="false" aria-describedby="h-body e-body"></textarea>
+          <p class="hint" id="h-body">原样发送。发送 JSON 时，请在请求头里加上 Content-Type: application/json。留空表示不发送请求体。</p>
+          <p class="field-error" id="e-body" hidden></p>
+        </div>
+      </section>
+
+      <section class="form-section" aria-labelledby="section-rule">
+        <h3 id="section-rule">报警规则</h3>
+        <div class="field">
+          <label for="f-json-path">JSON 字段路径</label>
+          <input class="input" id="f-json-path" type="text" autocomplete="off" spellcheck="false" placeholder="data.balance 或 accounts[0].remaining" aria-describedby="e-json-path">
+          <p class="field-error" id="e-json-path" hidden></p>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="f-multiplier">倍率</label>
+            <input class="input" id="f-multiplier" type="text" inputmode="decimal" autocomplete="off" aria-describedby="e-multiplier">
+            <p class="field-error" id="e-multiplier" hidden></p>
+          </div>
+          <div class="field">
+            <label for="f-offset">偏移量</label>
+            <input class="input" id="f-offset" type="text" inputmode="decimal" autocomplete="off" aria-describedby="e-offset">
+            <p class="field-error" id="e-offset" hidden></p>
+          </div>
+        </div>
+        <p class="hint">换算后的值 = 接口原始值 × 倍率 + 偏移量</p>
+        <details class="sample">
+          <summary>按样本算倍率</summary>
+          <div class="sample-body">
+            <div class="row">
+              <div class="field">
+                <label for="sample-raw">接口原始值</label>
+                <input class="input" id="sample-raw" type="text" inputmode="decimal" autocomplete="off" aria-describedby="e-sample">
+              </div>
+              <div class="field">
+                <label for="sample-actual">对应的实际值</label>
+                <input class="input" id="sample-actual" type="text" inputmode="decimal" autocomplete="off" aria-describedby="e-sample">
+              </div>
+            </div>
+            <div class="field">
+              <button type="button" class="button small" id="sample-apply">填入倍率</button>
+              <p class="field-error" id="e-sample" hidden></p>
+            </div>
+          </div>
+        </details>
+        <div class="field">
+          <span class="field-label" id="rule-label">报警条件</span>
+          <div class="rule-sentence" role="group" aria-labelledby="rule-label">
+            <span>换算后的值</span>
+            <select class="input fit" id="f-operator" aria-label="比较方式">
+              <option value="<">低于</option>
+              <option value="<=">不高于</option>
+              <option value=">">高于</option>
+              <option value=">=">不低于</option>
+              <option value="=">等于</option>
+            </select>
+            <input class="input fit" id="f-threshold" type="text" inputmode="decimal" autocomplete="off" aria-label="报警值" aria-describedby="e-threshold">
+            <span>时报警</span>
+          </div>
+          <p class="field-error" id="e-threshold" hidden></p>
+          <p class="preview" id="rule-preview" hidden></p>
+        </div>
+      </section>
+
+      <section class="form-section" aria-labelledby="section-schedule">
+        <h3 id="section-schedule">检测与提醒</h3>
+        <div class="row">
+          <div class="field">
+            <label for="f-poll">检测间隔（秒）</label>
+            <input class="input" id="f-poll" type="text" inputmode="numeric" autocomplete="off" aria-describedby="e-poll">
+            <p class="field-error" id="e-poll" hidden></p>
+          </div>
+          <div class="field">
+            <label for="f-timeout">超时（秒）</label>
+            <input class="input" id="f-timeout" type="text" inputmode="numeric" autocomplete="off" aria-describedby="e-timeout">
+            <p class="field-error" id="e-timeout" hidden></p>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label for="f-error-threshold">连续出错几次后报警</label>
+            <input class="input" id="f-error-threshold" type="text" inputmode="numeric" autocomplete="off" aria-describedby="e-error-threshold">
+            <p class="field-error" id="e-error-threshold" hidden></p>
+          </div>
+          <div class="field">
+            <label for="f-repeat">重复报警间隔（秒）</label>
+            <input class="input" id="f-repeat" type="text" inputmode="numeric" autocomplete="off" aria-describedby="h-repeat e-repeat">
+            <p class="hint" id="h-repeat">填 0 表示每次异常只报一次。</p>
+            <p class="field-error" id="e-repeat" hidden></p>
+          </div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="f-enabled" aria-describedby="h-enabled">
+          <span class="switch-track" aria-hidden="true"></span>
+          <span>启用此监控</span>
+        </label>
+        <p class="hint" id="h-enabled">停用后服务端不再检测这个接口，也不会报警。</p>
+      </section>
+    </div>
+
+    <footer class="drawer-foot">
+      <button type="submit" class="button primary" id="save-button">保存</button>
+      <button type="button" class="button" id="test-button">测试</button>
+      <span class="drawer-status" id="editor-status" aria-live="polite"></span>
+      <span class="spacer"></span>
+      <button type="button" class="button quiet" id="copy-button">复制</button>
+      <button type="button" class="button danger-text" id="delete-button">删除</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog class="confirm" id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+  <h2 id="confirm-title"></h2>
+  <p id="confirm-body"></p>
+  <div class="confirm-actions">
+    <button type="button" class="button" id="confirm-cancel">取消</button>
+    <button type="button" class="button primary" id="confirm-accept">确定</button>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+"use strict";
+(() => {
+  const TOKEN_KEY = "credit-inform-admin-token";
+  const POLL_MS = 10000;
+  const ADMIN_PATH = "/api/v1/admin/monitors";
+  const OPERATOR_WORDS = { "<": "低于", "<=": "不高于", ">": "高于", ">=": "不低于", "=": "等于", "==": "等于" };
+  const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+  const DEFAULT_MONITOR = {
+    provider: "http", gatewayAccessKey: "", gatewaySecretKeyEnv: "GATEWAY_SK",
+    name: "", url: "", method: "GET", headersJson: "{}", body: null,
+    jsonPath: "", operator: "<", threshold: "", multiplier: 1, offset: 0,
+    pollIntervalSeconds: 60, timeoutSeconds: 10, errorThreshold: 3,
+    repeatAlertSeconds: 300, enabled: true,
+  };
+  const ERROR_TEXT = {
+    network: "无法连接服务端，请检查网络后重试。",
+    unauthorized: "管理员密钥不正确，或服务端已经更换了密钥。",
+    revision_conflict: "这个监控刚在别处被修改过，表单已换成最新配置。请重新修改后再保存。",
+    not_found: "这个监控已经不存在，可能已在别处删除。",
+    monitor_busy: "这个监控正在检测，请稍后再试。",
+    refresh_in_progress: "正在检测全部监控，请稍后再试。",
+    order_conflict: "监控列表在别处有变动，已载入最新顺序，请重新调整。",
+    already_exists: "已经有相同 ID 的监控。",
+    group_required: "服务端配置了多个分组，网页暂不支持。",
+    internal_error: "服务端内部出错，修改可能没有保存。请刷新页面确认。",
+  };
+
+  const byId = (id) => document.getElementById(id);
+  const ui = {
+    loginView: byId("login-view"), loginForm: byId("login-form"), loginToken: byId("login-token"),
+    loginRemember: byId("login-remember"), loginError: byId("login-error"),
+    loginSubmit: byId("login-submit"), loginWarning: byId("login-warning"),
+    appView: byId("app-view"), serverMeta: byId("server-meta"), serverStatus: byId("server-status"),
+    logoutButton: byId("logout-button"),
+    toolbarMain: byId("toolbar-main"), toolbarSort: byId("toolbar-sort"),
+    createButton: byId("create-button"), refreshButton: byId("refresh-button"), sortButton: byId("sort-button"),
+    sortSave: byId("sort-save"), sortCancel: byId("sort-cancel"), syncStatus: byId("sync-status"),
+    grid: byId("monitor-grid"), panelEmpty: byId("panel-empty"),
+    editor: byId("editor"), editorForm: byId("editor-form"), editorTitle: byId("editor-title"),
+    editorClose: byId("editor-close"), editorBody: byId("editor-body"), editorMessage: byId("editor-message"),
+    editorStatus: byId("editor-status"),
+    readout: byId("readout"), readoutWindow: byId("readout-window"), readoutValue: byId("readout-value"),
+    readoutState: byId("readout-state"), readoutMeta: byId("readout-meta"), testResult: byId("test-result"),
+    headerRows: byId("header-rows"), addHeader: byId("add-header"), bodyField: byId("body-field"),
+    sampleRaw: byId("sample-raw"), sampleActual: byId("sample-actual"), sampleApply: byId("sample-apply"),
+    sampleError: byId("e-sample"), preview: byId("rule-preview"),
+    saveButton: byId("save-button"), testButton: byId("test-button"),
+    copyButton: byId("copy-button"), deleteButton: byId("delete-button"),
+    confirmDialog: byId("confirm-dialog"), confirmTitle: byId("confirm-title"), confirmBody: byId("confirm-body"),
+    confirmAccept: byId("confirm-accept"), confirmCancel: byId("confirm-cancel"),
+    toast: byId("toast"),
+  };
+  const fields = {
+    provider: byId("f-provider"), gatewayAccessKey: byId("f-gateway-ak"), gatewaySecretKeyEnv: byId("f-gateway-sk-env"),
+    name: byId("f-name"), url: byId("f-url"), body: byId("f-body"), jsonPath: byId("f-json-path"),
+    operator: byId("f-operator"), threshold: byId("f-threshold"),
+    multiplier: byId("f-multiplier"), offset: byId("f-offset"),
+    poll: byId("f-poll"), timeout: byId("f-timeout"),
+    errorThreshold: byId("f-error-threshold"), repeat: byId("f-repeat"), enabled: byId("f-enabled"),
+  };
+  // Validation keys in form order, so the first error found is also the first one on screen.
+  const ERROR_SLOTS = {
+    gatewayAccessKey: [fields.gatewayAccessKey, "e-gateway-ak"],
+    gatewaySecretKeyEnv: [fields.gatewaySecretKeyEnv, "e-gateway-sk-env"],
+    name: [fields.name, "e-name"], url: [fields.url, "e-url"], headers: [null, "e-headers"],
+    body: [fields.body, "e-body"], jsonPath: [fields.jsonPath, "e-json-path"],
+    multiplier: [fields.multiplier, "e-multiplier"], offset: [fields.offset, "e-offset"],
+    threshold: [fields.threshold, "e-threshold"], poll: [fields.poll, "e-poll"],
+    timeout: [fields.timeout, "e-timeout"], errorThreshold: [fields.errorThreshold, "e-error-threshold"],
+    repeat: [fields.repeat, "e-repeat"],
+  };
+
+  const state = {
+    token: "",
+    loaded: false,
+    monitors: [],
+    statuses: new Map(),
+    clockOffset: 0,
+    lastSyncAt: 0,
+    syncError: "",
+    sorting: null,
+    sortBase: null,
+    editing: null,
+    editorBusy: false,
+    pollTimer: 0,
+  };
+
+  class ApiFailure extends Error {
+    constructor(status, code, message) {
+      super(message);
+      this.status = status;
+      this.code = code;
+    }
+  }
+
+  async function api(method, path, body) {
+    const headers = { Authorization: `Bearer ${state.token}` };
+    const init = { method, headers, cache: "no-store" };
+    if (body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    let response;
+    try {
+      response = await fetch(path, init);
+    } catch {
+      throw new ApiFailure(0, "network", "");
+    }
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    if (!response.ok) {
+      const error = (payload && payload.error) || {};
+      throw new ApiFailure(response.status, error.code || `http_${response.status}`, error.message || "");
+    }
+    return payload || {};
+  }
+
+  function describeError(error) {
+    if (error instanceof ApiFailure) {
+      if (ERROR_TEXT[error.code]) return ERROR_TEXT[error.code];
+      if (error.code === "invalid_request") return `服务端拒绝了这次修改：${error.message}`;
+      return error.message ? `服务端返回错误：${error.message}` : `服务端返回错误（HTTP ${error.status}）。`;
+    }
+    return (error && error.message) || String(error);
+  }
+
+  function handleAuthLoss(error) {
+    if (!(error instanceof ApiFailure) || error.code !== "unauthorized") return false;
+    clearStoredToken();
+    showLogin("管理员密钥已失效，请重新登录。");
+    return true;
+  }
+
+  function readStoredToken() {
+    try {
+      return sessionStorage.getItem(TOKEN_KEY) || localStorage.getItem(TOKEN_KEY) || "";
+    } catch {
+      return "";
+    }
+  }
+
+  function storeToken(token, remember) {
+    clearStoredToken();
+    try {
+      (remember ? localStorage : sessionStorage).setItem(TOKEN_KEY, token);
+    } catch {
+      // Storage can be unavailable in private windows; the session still works until reload.
+    }
+  }
+
+  function clearStoredToken() {
+    try {
+      sessionStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(TOKEN_KEY);
+    } catch {
+      // Nothing stored.
+    }
+  }
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function setBusy(button, busy, label) {
+    if (busy) {
+      button.dataset.label = button.textContent;
+      button.textContent = label;
+    } else if (button.dataset.label) {
+      button.textContent = button.dataset.label;
+      delete button.dataset.label;
+    }
+    button.disabled = busy;
+  }
+
+  let toastTimer = 0;
+  function toast(message, isError = false) {
+    clearTimeout(toastTimer);
+    ui.toast.textContent = message;
+    ui.toast.classList.toggle("is-error", isError);
+    ui.toast.classList.add("is-visible");
+    toastTimer = setTimeout(() => {
+      ui.toast.classList.remove("is-visible");
+      ui.toast.textContent = "";
+    }, isError ? 6000 : 3500);
+  }
+
+  let confirmResolver = null;
+  function confirmAction({ title, body, accept, cancel = "取消", danger = false }) {
+    ui.confirmTitle.textContent = title;
+    ui.confirmBody.textContent = body;
+    ui.confirmAccept.textContent = accept;
+    ui.confirmCancel.textContent = cancel;
+    ui.confirmAccept.classList.toggle("danger", danger);
+    ui.confirmAccept.classList.toggle("primary", !danger);
+    ui.confirmDialog.returnValue = "";
+    ui.confirmDialog.showModal();
+    ui.confirmCancel.focus();
+    return new Promise((resolve) => {
+      confirmResolver = resolve;
+    });
+  }
+  ui.confirmAccept.addEventListener("click", () => ui.confirmDialog.close("accept"));
+  ui.confirmCancel.addEventListener("click", () => ui.confirmDialog.close("cancel"));
+  ui.confirmDialog.addEventListener("close", () => {
+    const resolve = confirmResolver;
+    confirmResolver = null;
+    if (resolve) resolve(ui.confirmDialog.returnValue === "accept");
+  });
+
+  // Time and numbers
+
+  const serverNow = () => Date.now() + state.clockOffset;
+
+  function ago(timestamp) {
+    const seconds = Math.max(0, Math.round((serverNow() - timestamp) / 1000));
+    if (seconds < 15) return "刚刚";
+    if (seconds < 60) return `${seconds} 秒前`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes} 分钟前`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 48) return `${hours} 小时前`;
+    return new Date(timestamp).toLocaleString("zh-CN", { hour12: false });
+  }
+
+  function until(timestamp) {
+    const seconds = Math.round((timestamp - serverNow()) / 1000);
+    if (seconds <= 5) return "即将开始";
+    if (seconds < 90) return `约 ${seconds} 秒后`;
+    return `约 ${Math.round(seconds / 60)} 分钟后`;
+  }
+
+  const clock = (ms) => new Date(ms).toLocaleTimeString("zh-CN", { hour12: false });
+
+  function formatNumber(value) {
+    if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+    const magnitude = Math.abs(value);
+    if (magnitude !== 0 && magnitude < 0.001) return value.toExponential(2);
+    return value.toLocaleString("zh-CN", { maximumFractionDigits: magnitude < 1 ? 4 : 2 });
+  }
+
+  function numberText(value) {
+    if (typeof value === "number") return Number.isFinite(value) ? String(value) : "";
+    return value === null || value === undefined ? "" : String(value);
+  }
+
+  function parseFieldNumber(input) {
+    const text = input.value.trim();
+    if (text === "") return null;
+    const value = Number(text);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  function compareValue(value, operator, threshold) {
+    switch (operator) {
+      case "<": return value < threshold;
+      case "<=": return value <= threshold;
+      case ">": return value > threshold;
+      case ">=": return value >= threshold;
+      default: return Math.abs(value - threshold) <= 0.000001;
+    }
+  }
+
+  // Monitor readings
+
+  function readingOf(monitor) {
+    const status = state.statuses.get(monitor.id) || null;
+    if (!monitor.enabled) return { key: "off", label: "已停用", status };
+    if (!status || !status.lastCheckAt) return { key: "pending", label: "等待首次检测", status };
+    if (status.lastError) {
+      const alerted = status.consecutiveErrors >= monitor.errorThreshold;
+      return {
+        key: "fault",
+        label: alerted ? `连续 ${status.consecutiveErrors} 次出错，已报警` : "检测出错",
+        status,
+      };
+    }
+    if (status.breached) return { key: "alarm", label: "报警中", status };
+    return { key: "normal", label: "正常", status };
+  }
+
+  function shownValue(reading) {
+    if (reading.key !== "normal" && reading.key !== "alarm") return "—";
+    return formatNumber(reading.status.lastValue);
+  }
+
+  function ruleText(monitor) {
+    const word = OPERATOR_WORDS[monitor.operator] || monitor.operator;
+    return `${word} ${formatNumber(Number(monitor.threshold))} 时报警`;
+  }
+
+  function metaText(reading) {
+    switch (reading.key) {
+      case "off":
+      case "pending":
+        return reading.label;
+      case "fault":
+        return `${reading.label}：${reading.status.lastError}`;
+      case "alarm":
+        return `报警中，${ago(reading.status.lastCheckAt)}检测`;
+      default:
+        return `${ago(reading.status.lastCheckAt)}检测`;
+    }
+  }
+
+  // Panel
+
+  function orderedMonitors() {
+    if (state.sorting === null) return state.monitors;
+    const byKey = new Map(state.monitors.map((monitor) => [monitor.id, monitor]));
+    return state.sorting.map((id) => byKey.get(id)).filter(Boolean);
+  }
+
+  function findWindow(id) {
+    return [...ui.grid.children].find((node) => node.dataset.id === id) || null;
+  }
+
+  function renderPanel() {
+    const active = document.activeElement;
+    let focusKey = null;
+    if (active && ui.grid.contains(active)) {
+      const holder = active.closest("[data-id]");
+      focusKey = holder ? { id: holder.dataset.id, action: active.dataset.action || "" } : null;
+    }
+
+    const ordered = orderedMonitors();
+    ui.grid.replaceChildren(...ordered.map((monitor, index) => renderWindow(monitor, index, ordered.length)));
+    ui.grid.hidden = ordered.length === 0;
+    ui.panelEmpty.hidden = ordered.length > 0;
+    ui.panelEmpty.textContent = state.loaded
+      ? "还没有监控。点“新建监控”添加要检测的接口。"
+      : "正在载入监控…";
+    renderSyncStatus();
+
+    if (focusKey) {
+      const holder = findWindow(focusKey.id);
+      if (holder) {
+        let target = focusKey.action ? holder.querySelector(`[data-action="${focusKey.action}"]`) : holder;
+        if (!target || target.disabled || target.tagName !== "BUTTON") {
+          target = holder.tagName === "BUTTON" ? holder : holder.querySelector("button:not(:disabled)");
+        }
+        if (target) target.focus();
+      }
+    }
+  }
+
+  function renderWindow(monitor, index, total) {
+    const reading = readingOf(monitor);
+    const sorting = state.sorting !== null;
+    const node = el(sorting ? "div" : "button", `window is-${reading.key}`);
+    node.dataset.id = monitor.id;
+    node.append(
+      el("span", "window-name", monitor.name),
+      el("span", "window-value", shownValue(reading)),
+      el("span", "window-rule", ruleText(monitor)),
+      el("span", "window-meta", metaText(reading)),
+    );
+    if (!sorting) {
+      node.type = "button";
+      node.addEventListener("click", () => openEditor(monitor.id));
+      return node;
+    }
+    const controls = el("span", "window-sort");
+    controls.append(
+      sortButton("前移", "back", `把“${monitor.name}”前移一格`, index === 0, () => moveSorting(index, -1)),
+      sortButton("后移", "forward", `把“${monitor.name}”后移一格`, index === total - 1, () => moveSorting(index, 1)),
+    );
+    node.append(controls);
+    return node;
+  }
+
+  function sortButton(label, action, description, disabled, onClick) {
+    const button = el("button", "button small", label);
+    button.type = "button";
+    button.dataset.action = action;
+    button.disabled = disabled;
+    button.setAttribute("aria-label", description);
+    button.addEventListener("click", onClick);
+    return button;
+  }
+
+  function moveSorting(index, delta) {
+    const target = index + delta;
+    if (target < 0 || target >= state.sorting.length) return;
+    [state.sorting[index], state.sorting[target]] = [state.sorting[target], state.sorting[index]];
+    renderPanel();
+  }
+
+  function renderSyncStatus() {
+    ui.syncStatus.classList.toggle("is-error", Boolean(state.syncError));
+    if (state.syncError) {
+      ui.syncStatus.textContent = `同步失败：${state.syncError}`;
+      return;
+    }
+    if (!state.loaded) {
+      ui.syncStatus.textContent = "";
+      return;
+    }
+    const readings = state.monitors.map(readingOf);
+    const alarms = readings.filter((reading) => reading.key === "alarm").length;
+    const faults = readings.filter((reading) => reading.key === "fault").length;
+    const parts = [`${state.monitors.length} 个监控`];
+    if (alarms) parts.push(`${alarms} 个报警中`);
+    if (faults) parts.push(`${faults} 个检测出错`);
+    ui.syncStatus.textContent = `${parts.join("，")}。${clock(state.lastSyncAt)} 已同步`;
+  }
+
+  function renderHealth(health) {
+    ui.serverStatus.classList.toggle("is-degraded", !health || health.status !== "ok");
+    if (!health) {
+      ui.serverStatus.textContent = "无法连接服务端";
+      return;
+    }
+    ui.serverMeta.textContent = `值守报警服务端，版本 ${health.version}`;
+    const online = health.clients ? health.clients.online : 0;
+    ui.serverStatus.textContent = health.status === "ok"
+      ? `服务运行正常，在线客户端 ${online} 个`
+      : `服务异常：${(health.config && health.config.lastError) || "监控调度没有正常运行"}`;
+  }
+
+  // Loading
+
+  async function loadMonitors() {
+    const payload = await api("GET", ADMIN_PATH);
+    state.monitors = Array.isArray(payload.monitors) ? payload.monitors : [];
+    const statuses = Array.isArray(payload.statuses) ? payload.statuses : [];
+    state.statuses = new Map(statuses.map((status) => [status.id, status]));
+    if (typeof payload.serverTime === "number") state.clockOffset = payload.serverTime - Date.now();
+    state.lastSyncAt = Date.now();
+    state.syncError = "";
+    state.loaded = true;
+    renderPanel();
+    if (state.editing) renderReadout();
+  }
+
+  async function loadHealth() {
+    try {
+      const response = await fetch("/health", { cache: "no-store" });
+      renderHealth(await response.json());
+    } catch {
+      renderHealth(null);
+    }
+  }
+
+  function schedulePoll() {
+    clearTimeout(state.pollTimer);
+    state.pollTimer = setTimeout(pollOnce, POLL_MS);
+  }
+
+  async function pollOnce() {
+    if (!state.token) return;
+    if (!document.hidden) {
+      try {
+        await loadMonitors();
+      } catch (error) {
+        if (handleAuthLoss(error)) return;
+        state.syncError = describeError(error);
+        renderSyncStatus();
+      }
+      loadHealth();
+    }
+    schedulePoll();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.token) {
+      clearTimeout(state.pollTimer);
+      pollOnce();
+    }
+  });
+
+  // Views
+
+  function showLogin(message = "") {
+    clearTimeout(state.pollTimer);
+    state.token = "";
+    state.loaded = false;
+    state.monitors = [];
+    state.statuses = new Map();
+    state.sorting = null;
+    if (ui.editor.open) closeEditor();
+    if (ui.confirmDialog.open) ui.confirmDialog.close("cancel");
+    ui.appView.hidden = true;
+    ui.loginView.hidden = false;
+    ui.loginError.textContent = message;
+    ui.loginError.hidden = !message;
+    ui.loginToken.focus();
+  }
+
+  function showApp() {
+    ui.loginView.hidden = true;
+    ui.appView.hidden = false;
+    setSortingUi(false);
+    renderPanel();
+    loadHealth();
+    schedulePoll();
+  }
+
+  ui.loginForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const token = ui.loginToken.value.trim();
+    if (!token) {
+      ui.loginError.textContent = "请输入管理员密钥。";
+      ui.loginError.hidden = false;
+      ui.loginToken.focus();
+      return;
+    }
+    setBusy(ui.loginSubmit, true, "正在登录…");
+    state.token = token;
+    try {
+      await loadMonitors();
+      storeToken(token, ui.loginRemember.checked);
+      ui.loginToken.value = "";
+      ui.loginError.hidden = true;
+      showApp();
+      ui.createButton.focus();
+    } catch (error) {
+      state.token = "";
+      ui.loginError.textContent = describeError(error);
+      ui.loginError.hidden = false;
+      ui.loginToken.focus();
+    } finally {
+      setBusy(ui.loginSubmit, false);
+    }
+  });
+
+  ui.logoutButton.addEventListener("click", () => {
+    clearStoredToken();
+    showLogin();
+  });
+
+  // Toolbar
+
+  ui.refreshButton.addEventListener("click", async () => {
+    setBusy(ui.refreshButton, true, "正在检测…");
+    try {
+      const result = await api("POST", `${ADMIN_PATH}/refresh`, {});
+      if (result.total === 0) toast("没有已启用的监控。");
+      else if (result.failed) toast(`检测了 ${result.total} 个监控，${result.failed} 个出错。`, true);
+      else toast(`检测了 ${result.total} 个监控，全部成功。`);
+      await loadMonitors();
+    } catch (error) {
+      if (!handleAuthLoss(error)) toast(describeError(error), true);
+    } finally {
+      setBusy(ui.refreshButton, false);
+    }
+  });
+
+  function setSortingUi(sorting) {
+    ui.toolbarMain.hidden = sorting;
+    ui.toolbarSort.hidden = !sorting;
+  }
+
+  function endSorting() {
+    state.sorting = null;
+    state.sortBase = null;
+    setSortingUi(false);
+    renderPanel();
+  }
+
+  ui.sortButton.addEventListener("click", () => {
+    if (state.monitors.length < 2) {
+      toast("至少要有两个监控才能调整顺序。");
+      return;
+    }
+    state.sorting = state.monitors.map((monitor) => monitor.id);
+    state.sortBase = [...state.sorting];
+    setSortingUi(true);
+    renderPanel();
+    const first = ui.grid.querySelector("button:not(:disabled)");
+    if (first) first.focus();
+  });
+
+  ui.sortCancel.addEventListener("click", () => {
+    endSorting();
+    ui.sortButton.focus();
+  });
+
+  ui.sortSave.addEventListener("click", async () => {
+    if (state.sorting.every((id, index) => id === state.sortBase[index])) {
+      endSorting();
+      ui.sortButton.focus();
+      toast("顺序没有变化。");
+      return;
+    }
+    setBusy(ui.sortSave, true, "正在保存…");
+    try {
+      const result = await api("POST", `${ADMIN_PATH}/reorder`, {
+        expectedMonitorIds: state.sortBase,
+        monitorIds: state.sorting,
+      });
+      state.monitors = result.monitors;
+      endSorting();
+      ui.sortButton.focus();
+      toast("顺序已保存");
+    } catch (error) {
+      if (handleAuthLoss(error)) return;
+      if (error instanceof ApiFailure && error.code === "order_conflict") {
+        endSorting();
+        loadMonitors().catch(() => {});
+      }
+      toast(describeError(error), true);
+    } finally {
+      setBusy(ui.sortSave, false);
+    }
+  });
+
+  ui.createButton.addEventListener("click", () => openEditor(null));
+
+  // Editor
+
+  function currentMethod() {
+    const checked = ui.editorForm.querySelector('input[name="method"]:checked');
+    return checked ? checked.value : "GET";
+  }
+
+  function setMethod(method) {
+    for (const radio of ui.editorForm.querySelectorAll('input[name="method"]')) {
+      radio.checked = radio.value === method;
+    }
+    ui.bodyField.hidden = method !== "POST";
+  }
+
+  function syncProvider() {
+    const gateway = fields.provider.value === "gateway";
+    byId("gateway-fields").hidden = !gateway;
+    byId("method-field").hidden = gateway;
+    byId("headers-field").hidden = gateway;
+    byId("h-body").textContent = gateway
+      ? "填写业务参数 JSON 对象，例如 {}。留空会发送加密的 {}；无需填写 payload 或鉴权头。"
+      : "原样发送。发送 JSON 时，请在请求头里加上 Content-Type: application/json。留空表示不发送请求体。";
+    if (gateway) setMethod("POST");
+  }
+
+  function parseHeaders(headersJson) {
+    try {
+      const document = JSON.parse(headersJson || "{}");
+      if (!document || typeof document !== "object" || Array.isArray(document)) return [];
+      return Object.entries(document).map(([name, value]) => [name, String(value)]);
+    } catch {
+      return [];
+    }
+  }
+
+  function addHeaderRow(name = "", value = "") {
+    const row = el("div", "header-row");
+    const nameInput = el("input", "input");
+    nameInput.type = "text";
+    nameInput.value = name;
+    nameInput.placeholder = "名称，例如 Authorization";
+    nameInput.autocomplete = "off";
+    nameInput.spellcheck = false;
+    nameInput.dataset.role = "name";
+    nameInput.setAttribute("aria-label", "请求头名称");
+
+    const valueInput = el("input", "input");
+    valueInput.type = "password";
+    valueInput.value = value;
+    valueInput.placeholder = "值";
+    valueInput.autocomplete = "off";
+    valueInput.spellcheck = false;
+    valueInput.dataset.role = "value";
+    valueInput.setAttribute("aria-label", "请求头的值");
+
+    const reveal = el("button", "button quiet small", "显示");
+    reveal.type = "button";
+    reveal.setAttribute("aria-pressed", "false");
+    reveal.setAttribute("aria-label", "显示请求头的值");
+    reveal.addEventListener("click", () => {
+      const show = valueInput.type === "password";
+      valueInput.type = show ? "text" : "password";
+      reveal.textContent = show ? "隐藏" : "显示";
+      reveal.setAttribute("aria-pressed", String(show));
+    });
+
+    const remove = el("button", "button quiet small", "删除");
+    remove.type = "button";
+    remove.setAttribute("aria-label", "删除这个请求头");
+    remove.addEventListener("click", () => {
+      const neighbour = row.nextElementSibling || row.previousElementSibling;
+      row.remove();
+      editorChanged();
+      (neighbour ? neighbour.querySelector("input") : ui.addHeader).focus();
+    });
+
+    row.append(nameInput, valueInput, reveal, remove);
+    ui.headerRows.append(row);
+    return nameInput;
+  }
+
+  function headerEntries() {
+    return [...ui.headerRows.children].map((row) => [
+      row.querySelector('[data-role="name"]').value,
+      row.querySelector('[data-role="value"]').value,
+    ]);
+  }
+
+  function formSnapshot() {
+    return JSON.stringify([
+      fields.provider.value, fields.gatewayAccessKey.value, fields.gatewaySecretKeyEnv.value,
+      fields.name.value, fields.url.value, currentMethod(), headerEntries(), fields.body.value,
+      fields.jsonPath.value, fields.operator.value, fields.threshold.value,
+      fields.multiplier.value, fields.offset.value, fields.poll.value, fields.timeout.value,
+      fields.errorThreshold.value, fields.repeat.value, fields.enabled.checked,
+    ]);
+  }
+
+  const isDirty = () => state.editing !== null && formSnapshot() !== state.editing.snapshot;
+
+  function fillForm(monitor) {
+    fields.provider.value = monitor.provider || "http";
+    fields.gatewayAccessKey.value = monitor.gatewayAccessKey || "";
+    fields.gatewaySecretKeyEnv.value = monitor.gatewaySecretKeyEnv || "GATEWAY_SK";
+    fields.name.value = monitor.name || "";
+    fields.url.value = monitor.url || "";
+    setMethod(monitor.method === "POST" ? "POST" : "GET");
+    ui.headerRows.replaceChildren();
+    for (const [name, value] of parseHeaders(monitor.headersJson)) addHeaderRow(name, value);
+    const body = monitor.body;
+    state.editing.bodyWasJson = body !== null && body !== undefined && typeof body !== "string";
+    state.editing.initialBody = body === null || body === undefined
+      ? ""
+      : typeof body === "string" ? body : JSON.stringify(body, null, 2);
+    fields.body.value = state.editing.initialBody;
+    fields.jsonPath.value = monitor.jsonPath || "";
+    fields.operator.value = monitor.operator === "==" ? "=" : (monitor.operator || "<");
+    fields.threshold.value = numberText(monitor.threshold);
+    fields.multiplier.value = numberText(monitor.multiplier);
+    fields.offset.value = numberText(monitor.offset);
+    fields.poll.value = numberText(monitor.pollIntervalSeconds);
+    fields.timeout.value = numberText(monitor.timeoutSeconds);
+    fields.errorThreshold.value = numberText(monitor.errorThreshold);
+    fields.repeat.value = numberText(monitor.repeatAlertSeconds);
+    fields.enabled.checked = monitor.enabled !== false;
+    syncProvider();
+    ui.sampleError.hidden = true;
+    clearFieldErrors();
+    state.editing.snapshot = formSnapshot();
+    syncEditorButtons();
+    renderPreview();
+  }
+
+  function editingMonitor() {
+    if (!state.editing || !state.editing.id) return null;
+    return state.monitors.find((monitor) => monitor.id === state.editing.id) || null;
+  }
+
+  function updateEditorChrome() {
+    const monitor = editingMonitor();
+    ui.editorTitle.textContent = monitor ? `编辑“${monitor.name}”` : "新建监控";
+    ui.copyButton.hidden = !monitor;
+    ui.deleteButton.hidden = !monitor;
+    renderReadout();
+    renderTestResult();
+  }
+
+  function openEditor(id) {
+    const monitor = id ? state.monitors.find((item) => item.id === id) : null;
+    state.editing = {
+      id: monitor ? monitor.id : null,
+      revision: monitor ? monitor.revision : null,
+      testResult: null,
+    };
+    fillForm(monitor || DEFAULT_MONITOR);
+    clearEditorMessage();
+    updateEditorChrome();
+    ui.editor.showModal();
+    ui.editorBody.scrollTop = 0;
+    fields.name.focus();
+  }
+
+  function closeEditor() {
+    const id = state.editing ? state.editing.id : null;
+    state.editing = null;
+    state.editorBusy = false;
+    if (ui.editor.open) ui.editor.close();
+    if (!ui.appView.hidden) {
+      const tile = id ? findWindow(id) : null;
+      (tile && tile.tagName === "BUTTON" ? tile : ui.createButton).focus();
+    }
+  }
+
+  async function requestCloseEditor() {
+    if (!state.editing || state.editorBusy) return;
+    if (isDirty()) {
+      const discard = await confirmAction({
+        title: "放弃未保存的修改？",
+        body: "关闭后，这次的修改不会保存到服务端。",
+        accept: "放弃修改",
+        cancel: "继续编辑",
+        danger: true,
+      });
+      if (!discard) return;
+    }
+    closeEditor();
+  }
+
+  ui.editorClose.addEventListener("click", requestCloseEditor);
+  ui.editor.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    requestCloseEditor();
+  });
+  ui.editor.addEventListener("close", () => {
+    state.editing = null;
+    state.editorBusy = false;
+  });
+  let backdropPress = false;
+  ui.editor.addEventListener("pointerdown", (event) => {
+    backdropPress = event.target === ui.editor;
+  });
+  ui.editor.addEventListener("click", (event) => {
+    if (backdropPress && event.target === ui.editor) requestCloseEditor();
+    backdropPress = false;
+  });
+
+  function showEditorMessage(message, kind) {
+    ui.editorMessage.textContent = message;
+    ui.editorMessage.className = kind === "error" ? "notice is-error" : "notice";
+    ui.editorMessage.hidden = false;
+    ui.editorBody.scrollTop = 0;
+  }
+
+  function clearEditorMessage() {
+    ui.editorMessage.hidden = true;
+    ui.editorMessage.textContent = "";
+  }
+
+  function setEditorBusy(label) {
+    state.editorBusy = Boolean(label);
+    ui.editorForm.setAttribute("aria-busy", String(state.editorBusy));
+    ui.editorStatus.textContent = label || "";
+    syncEditorButtons();
+  }
+
+  function syncEditorButtons() {
+    if (!state.editing) return;
+    for (const button of [ui.saveButton, ui.testButton, ui.copyButton, ui.deleteButton, ui.editorClose]) {
+      button.disabled = state.editorBusy;
+    }
+    ui.testButton.textContent = !state.editing.id || isDirty() ? "保存并测试" : "测试";
+  }
+
+  function editorChanged() {
+    syncEditorButtons();
+    renderPreview();
+  }
+
+  const onFormEdit = (event) => {
+    if (event.target === fields.provider) {
+      if (fields.provider.value === "gateway") {
+        if (!fields.name.value.trim()) fields.name.value = "GateWay 余额";
+        if (!fields.url.value.trim()) fields.url.value = "https://op.privapi.cc/open/v1/balance/query";
+        if (!fields.jsonPath.value.trim()) fields.jsonPath.value = "data.balance";
+        if (Number(fields.poll.value) < 30) fields.poll.value = "60";
+      }
+      syncProvider();
+    }
+    if (event.target.name === "method") setMethod(currentMethod());
+    editorChanged();
+  };
+  ui.editorForm.addEventListener("input", onFormEdit);
+  ui.editorForm.addEventListener("change", onFormEdit);
+  ui.addHeader.addEventListener("click", () => {
+    addHeaderRow().focus();
+    editorChanged();
+  });
+
+  ui.sampleApply.addEventListener("click", () => {
+    const raw = parseFieldNumber(ui.sampleRaw);
+    const actual = parseFieldNumber(ui.sampleActual);
+    if (raw === null || actual === null || raw === 0) {
+      ui.sampleError.textContent = "请填写两个数字，接口原始值不能为 0。";
+      ui.sampleError.hidden = false;
+      return;
+    }
+    ui.sampleError.hidden = true;
+    fields.multiplier.value = String(actual / raw);
+    fields.offset.value = "0";
+    editorChanged();
+    fields.multiplier.focus();
+  });
+
+  function renderReadout() {
+    const monitor = editingMonitor();
+    if (!monitor) {
+      ui.readout.hidden = true;
+      return;
+    }
+    const reading = readingOf(monitor);
+    const status = reading.status;
+    ui.readoutWindow.className = `window is-${reading.key}`;
+    ui.readoutValue.textContent = shownValue(reading);
+    ui.readoutState.textContent = reading.label;
+    const details = [];
+    if (status && status.lastCheckAt) {
+      details.push(`${ago(status.lastCheckAt)}检测`);
+      if (status.lastHttpCode) details.push(`HTTP ${status.lastHttpCode}`);
+      if (typeof status.lastRawValue === "number") details.push(`原始值 ${formatNumber(status.lastRawValue)}`);
+    }
+    const sentences = [];
+    if (details.length) sentences.push(details.join("，"));
+    if (status && status.lastError) sentences.push(`错误：${status.lastError}`);
+    if (monitor.enabled && status && status.nextCheckAt) sentences.push(`下次检测${until(status.nextCheckAt)}`);
+    ui.readoutMeta.textContent = sentences.length ? `${sentences.join("。")}。` : "";
+    ui.readout.hidden = false;
+    renderPreview();
+  }
+
+  function renderTestResult() {
+    const payload = state.editing && state.editing.testResult;
+    if (!payload) {
+      ui.testResult.hidden = true;
+      return;
+    }
+    if (payload.ok && payload.result) {
+      const result = payload.result;
+      ui.testResult.className = "notice";
+      ui.testResult.textContent =
+        `测试完成：接口返回 HTTP ${result.httpCode}，原始值 ${formatNumber(result.rawValue)}，` +
+        `换算后 ${formatNumber(result.value)}。${result.breached ? "当前满足报警条件。" : "当前不满足报警条件。"}`;
+    } else {
+      const error = payload.error || {};
+      const message = error.message || "未知错误";
+      const code = error.httpCode && !message.startsWith("HTTP") ? `（HTTP ${error.httpCode}）` : "";
+      ui.testResult.className = "notice is-error";
+      ui.testResult.textContent = `测试失败：${message}${code}`;
+    }
+    ui.testResult.hidden = false;
+  }
+
+  function renderPreview() {
+    if (!state.editing) return;
+    const monitor = editingMonitor();
+    const status = monitor ? state.statuses.get(monitor.id) : null;
+    const tested = state.editing.testResult;
+    let raw = status && typeof status.lastRawValue === "number" ? status.lastRawValue : null;
+    if (raw === null && tested && tested.ok && tested.result) raw = tested.result.rawValue;
+    const multiplier = parseFieldNumber(fields.multiplier);
+    const offset = parseFieldNumber(fields.offset);
+    const threshold = parseFieldNumber(fields.threshold);
+    if (typeof raw !== "number" || multiplier === null || offset === null || threshold === null) {
+      ui.preview.hidden = true;
+      return;
+    }
+    const value = raw * multiplier + offset;
+    const breached = compareValue(value, fields.operator.value, threshold);
+    ui.preview.textContent =
+      `按现在填写的设置，最近一次原始值 ${formatNumber(raw)} 换算为 ${formatNumber(value)}，` +
+      `${breached ? "会触发报警" : "不会触发报警"}。`;
+    ui.preview.classList.toggle("is-breached", breached);
+    ui.preview.hidden = false;
+  }
+
+  function clearFieldErrors() {
+    for (const [input, slotId] of Object.values(ERROR_SLOTS)) {
+      const slot = byId(slotId);
+      slot.hidden = true;
+      slot.textContent = "";
+      if (input) input.removeAttribute("aria-invalid");
+    }
+  }
+
+  function showFieldErrors(errors) {
+    clearFieldErrors();
+    let first = null;
+    for (const [key, message] of errors) {
+      const [input, slotId] = ERROR_SLOTS[key];
+      const slot = byId(slotId);
+      slot.textContent = message;
+      slot.hidden = false;
+      if (input) input.setAttribute("aria-invalid", "true");
+      if (!first) first = input || ui.headerRows.querySelector("input") || ui.addHeader;
+    }
+    if (first) first.focus();
+  }
+
+  function isHttpUrl(text) {
+    try {
+      const url = new URL(text);
+      return (url.protocol === "http:" || url.protocol === "https:") && Boolean(url.hostname);
+    } catch {
+      return false;
+    }
+  }
+
+  function readNumber(input, key, emptyMessage, invalidMessage, errors) {
+    const text = input.value.trim();
+    if (text === "") {
+      errors.set(key, emptyMessage);
+      return null;
+    }
+    const value = Number(text);
+    if (!Number.isFinite(value)) errors.set(key, invalidMessage);
+    return value;
+  }
+
+  function readInteger(input, key, isValid, message, errors) {
+    const text = input.value.trim();
+    const value = Number(text);
+    if (text === "" || !Number.isInteger(value) || !isValid(value)) errors.set(key, message);
+    return value;
+  }
+
+  function readForm() {
+    const errors = new Map();
+    const gateway = fields.provider.value === "gateway";
+    const gatewayAccessKey = fields.gatewayAccessKey.value.trim();
+    const gatewaySecretKeyEnv = fields.gatewaySecretKeyEnv.value.trim();
+    if (gateway && !/^gwak_[0-9a-f]{24}$/.test(gatewayAccessKey)) errors.set("gatewayAccessKey", "AK 格式应为 gwak_ 加 24 位十六进制字符。");
+    if (gateway && !/^(?!gwsk_)[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(gatewaySecretKeyEnv)) errors.set("gatewaySecretKeyEnv", "请填写服务器环境变量名，例如 GATEWAY_SK，不要填写 SK 的值。");
+    const name = fields.name.value.trim();
+    if (!name) errors.set("name", "请填写名称。");
+    else if (name.length > 128) errors.set("name", "名称不能超过 128 个字符。");
+
+    const url = fields.url.value.trim();
+    if (!isHttpUrl(url)) errors.set("url", "请填写以 http:// 或 https:// 开头的完整地址。");
+    else if (url.length > 2048) errors.set("url", "地址不能超过 2048 个字符。");
+    if (gateway && !errors.has("url")) {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "https:" || parsed.username || parsed.password || url.includes("?") || url.includes("#") ||
+          !/^\/open\/v1\/(balance|nodes|logs|bans)\/query$/.test(parsed.pathname)) {
+        errors.set("url", "请使用 HTTPS 和文档中的完整接口路径，不带查询参数或结尾斜杠。");
+      }
+    }
+
+    const headers = {};
+    const seen = new Set();
+    for (const [rawName, value] of (gateway ? [] : headerEntries())) {
+      const headerName = rawName.trim();
+      if (!headerName && !value) continue;
+      let problem = "";
+      if (!headerName) problem = "每个请求头都要填写名称。";
+      else if (!HEADER_NAME.test(headerName)) problem = `请求头名称“${headerName}”只能包含字母、数字和 - _ 等符号。`;
+      else if (seen.has(headerName.toLowerCase())) problem = `请求头“${headerName}”重复了。`;
+      else if (/[\r\n]/.test(value)) problem = `请求头“${headerName}”的值不能换行。`;
+      if (problem) {
+        errors.set("headers", problem);
+        break;
+      }
+      seen.add(headerName.toLowerCase());
+      headers[headerName] = value;
+    }
+
+    const method = currentMethod();
+    let body;
+    const bodyText = fields.body.value;
+    if (method === "POST" && bodyText !== state.editing.initialBody) {
+      if (!bodyText.trim()) {
+        body = null;
+      } else if (state.editing.bodyWasJson) {
+        try {
+          body = JSON.parse(bodyText);
+        } catch {
+          errors.set("body", "这个请求体原本是 JSON，请填写有效的 JSON。");
+        }
+      } else {
+        body = bodyText;
+      }
+    }
+    if (gateway) {
+      try {
+        body = bodyText.trim() ? JSON.parse(bodyText) : null;
+        if (body !== null && (typeof body !== "object" || Array.isArray(body))) throw new Error();
+        if (bodyText.trim() && body === null) throw new Error();
+      } catch {
+        errors.set("body", "GateWay 业务参数必须是 JSON 对象，例如 {}。");
+      }
+    }
+
+    const jsonPath = fields.jsonPath.value.trim();
+    if (!jsonPath) errors.set("jsonPath", "请填写要读取的 JSON 字段路径。");
+    else if (jsonPath.length > 512) errors.set("jsonPath", "字段路径不能超过 512 个字符。");
+
+    const multiplier = readNumber(fields.multiplier, "multiplier", "请填写倍率，不换算就填 1。", "倍率必须是数字。", errors);
+    const offset = readNumber(fields.offset, "offset", "请填写偏移量，不需要就填 0。", "偏移量必须是数字。", errors);
+    const threshold = readNumber(fields.threshold, "threshold", "请填写报警值。", "报警值必须是数字。", errors);
+    const poll = readInteger(fields.poll, "poll", (value) => value >= 5, "检测间隔是不少于 5 的整数秒。", errors);
+    if (gateway && poll < 30) errors.set("poll", "GateWay 检测间隔不能少于 30 秒。");
+    const timeout = readInteger(fields.timeout, "timeout", (value) => value >= 1 && value <= 60, "超时是 1 到 60 之间的整数秒。", errors);
+    const errorThreshold = readInteger(fields.errorThreshold, "errorThreshold", (value) => value >= 1 && value <= 100, "请填写 1 到 100 之间的整数。", errors);
+    const repeat = readInteger(fields.repeat, "repeat", (value) => value === 0 || value >= 15, "填 0 表示只报一次，否则不能少于 15 秒。", errors);
+
+    const ordered = new Map(Object.keys(ERROR_SLOTS).filter((key) => errors.has(key)).map((key) => [key, errors.get(key)]));
+    const doc = {
+      provider: fields.provider.value, gatewayAccessKey, gatewaySecretKeyEnv,
+      name, url, method, headersJson: JSON.stringify(headers), jsonPath,
+      operator: fields.operator.value, threshold, multiplier, offset,
+      pollIntervalSeconds: poll, timeoutSeconds: timeout, errorThreshold,
+      repeatAlertSeconds: repeat, enabled: fields.enabled.checked,
+    };
+    if (body !== undefined) doc.body = body;
+    return { errors: ordered, doc };
+  }
+
+  function acceptSaved(monitor) {
+    const index = state.monitors.findIndex((item) => item.id === monitor.id);
+    if (index >= 0) state.monitors[index] = monitor;
+    else state.monitors.push(monitor);
+    state.editing.id = monitor.id;
+    state.editing.revision = monitor.revision;
+    state.editing.testResult = null;
+    fillForm(monitor);
+    updateEditorChrome();
+    renderPanel();
+    loadMonitors().catch(() => {});
+  }
+
+  async function reloadAfterConflict() {
+    try {
+      await loadMonitors();
+    } catch {
+      // Keep the current form; the message below still tells the user what happened.
+    }
+    if (!state.editing) return;
+    const latest = editingMonitor();
+    if (!latest) {
+      closeEditor();
+      toast(ERROR_TEXT.not_found, true);
+      return;
+    }
+    state.editing.revision = latest.revision;
+    fillForm(latest);
+    updateEditorChrome();
+    showEditorMessage(ERROR_TEXT.revision_conflict, "error");
+  }
+
+  async function saveEditor() {
+    if (!state.editing || state.editorBusy) return false;
+    const { errors, doc } = readForm();
+    showFieldErrors(errors);
+    if (errors.size) return false;
+    clearEditorMessage();
+    const editingId = state.editing.id;
+    setEditorBusy("正在保存…");
+    try {
+      const payload = editingId
+        ? await api("PUT", `${ADMIN_PATH}/${encodeURIComponent(editingId)}`, { ...doc, revision: state.editing.revision })
+        : await api("POST", ADMIN_PATH, doc);
+      setEditorBusy(null);
+      acceptSaved(payload.monitor);
+      toast(editingId ? "已保存" : "已新建监控");
+      return true;
+    } catch (error) {
+      setEditorBusy(null);
+      if (handleAuthLoss(error)) return false;
+      if (error instanceof ApiFailure && (error.code === "revision_conflict" || error.code === "not_found")) {
+        await reloadAfterConflict();
+      } else {
+        showEditorMessage(describeError(error), "error");
+      }
+      return false;
+    }
+  }
+
+  ui.editorForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveEditor();
+  });
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Saving reschedules the monitor, so its first background check can still be running.
+  async function runTest(id) {
+    const monitor = state.monitors.find((item) => item.id === id);
+    const deadline = Date.now() + ((monitor ? monitor.timeoutSeconds : 10) + 5) * 1000;
+    for (;;) {
+      try {
+        return await api("POST", `${ADMIN_PATH}/${encodeURIComponent(id)}/test`, {});
+      } catch (error) {
+        const busy = error instanceof ApiFailure && error.code === "monitor_busy";
+        if (!busy || Date.now() > deadline || !state.editing) throw error;
+        await sleep(1000);
+      }
+    }
+  }
+
+  ui.testButton.addEventListener("click", async () => {
+    if (!state.editing || state.editorBusy) return;
+    if ((!state.editing.id || isDirty()) && !(await saveEditor())) return;
+    if (!state.editing) return;
+    setEditorBusy("正在检测…");
+    try {
+      const payload = await runTest(state.editing.id);
+      if (!state.editing) return;
+      state.editing.testResult = payload;
+      renderTestResult();
+      renderPreview();
+      loadMonitors().catch(() => {});
+    } catch (error) {
+      if (!handleAuthLoss(error) && state.editing) showEditorMessage(describeError(error), "error");
+    } finally {
+      if (state.editing) setEditorBusy(null);
+    }
+  });
+
+  ui.copyButton.addEventListener("click", async () => {
+    const source = editingMonitor();
+    if (!source || state.editorBusy) return;
+    if (isDirty()) {
+      const proceed = await confirmAction({
+        title: "复制已保存的配置？",
+        body: "当前有未保存的修改，副本不会包含这些修改。",
+        accept: "继续复制",
+      });
+      if (!proceed) return;
+    }
+    setEditorBusy("正在复制…");
+    try {
+      const payload = await api("POST", `${ADMIN_PATH}/${encodeURIComponent(source.id)}/copy`, {});
+      const copy = payload.monitor;
+      const sourceIndex = state.monitors.findIndex((item) => item.id === source.id);
+      state.monitors.splice(sourceIndex + 1, 0, copy);
+      state.editing = { id: copy.id, revision: copy.revision, testResult: null };
+      setEditorBusy(null);
+      fillForm(copy);
+      updateEditorChrome();
+      renderPanel();
+      showEditorMessage(`已复制为“${copy.name}”。副本默认停用，改好后打开“启用此监控”再保存。`, "info");
+      fields.name.focus();
+      loadMonitors().catch(() => {});
+    } catch (error) {
+      setEditorBusy(null);
+      if (!handleAuthLoss(error)) showEditorMessage(describeError(error), "error");
+    }
+  });
+
+  ui.deleteButton.addEventListener("click", async () => {
+    const monitor = editingMonitor();
+    if (!monitor || state.editorBusy) return;
+    const confirmed = await confirmAction({
+      title: `删除“${monitor.name}”？`,
+      body: "删除后服务端不再检测这个接口，手机也不会再收到它的报警。删除后无法恢复。",
+      accept: "删除",
+      danger: true,
+    });
+    if (!confirmed) return;
+    setEditorBusy("正在删除…");
+    try {
+      await api("DELETE", `${ADMIN_PATH}/${encodeURIComponent(monitor.id)}`);
+      state.monitors = state.monitors.filter((item) => item.id !== monitor.id);
+      closeEditor();
+      renderPanel();
+      toast(`已删除“${monitor.name}”`);
+      loadMonitors().catch(() => {});
+    } catch (error) {
+      setEditorBusy(null);
+      if (handleAuthLoss(error)) return;
+      if (error instanceof ApiFailure && error.code === "not_found") {
+        closeEditor();
+        loadMonitors().catch(() => {});
+        toast(ERROR_TEXT.not_found, true);
+      } else {
+        showEditorMessage(describeError(error), "error");
+      }
+    }
+  });
+
+  window.addEventListener("beforeunload", (event) => {
+    if (isDirty()) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+  });
+
+  // Start
+
+  const insecure = location.protocol === "http:" &&
+    !["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  ui.loginWarning.hidden = !insecure;
+
+  const storedToken = readStoredToken();
+  if (storedToken) {
+    state.token = storedToken;
+    showApp();
+    loadMonitors().catch((error) => {
+      if (handleAuthLoss(error)) return;
+      state.syncError = describeError(error);
+      renderSyncStatus();
+    });
+  } else {
+    showLogin();
+  }
+})();
+</script>
+</body>
+</html>

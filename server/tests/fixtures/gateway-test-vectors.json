@@ -1,0 +1,43 @@
+{
+  "description": "Gateway 开放接口测试向量。SK 与 IV 取连续字节便于复现，真实环境必须随机生成。AAD 各行用 \\n 连接，末尾不加换行；payload 为标准 base64(iv || ciphertext || tag)。",
+  "access_key": "gwak_7c3e910a5bd24418e62f83c9",
+  "secret_key": "gwsk_EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8",
+  "secret_key_bytes_hex": "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f",
+  "derive": {
+    "algorithm": "HKDF-SHA256",
+    "salt": "access_key 的 ASCII",
+    "req_key": { "info": "gw-open/v1/req", "hex": "7bb01eac39a4c332c0e95aaf2f960547d1f86ef067c6b6d8a93ea52dfa3c3f96" },
+    "resp_key": { "info": "gw-open/v1/resp", "hex": "d9f4e58d0ee6c7ef017e229d879964210f59b7a8a4f5c9d45370202fb7dd39f8" }
+  },
+  "request": {
+    "path": "/open/v1/balance/query",
+    "timestamp": "1792646400",
+    "nonce": "c4a1f09e2b7d4e6385a0d9f1b3e27c58",
+    "plaintext": "{}",
+    "iv_hex": "202122232425262728292a2b",
+    "aad": "GW1-REQ\nPOST\n/open/v1/balance/query\ngwak_7c3e910a5bd24418e62f83c9\n1792646400\nc4a1f09e2b7d4e6385a0d9f1b3e27c58",
+    "payload": "ICEiIyQlJicoKSorsqJ51zks159KKfVWmDAwdN78"
+  },
+  "response": {
+    "plaintext": "{\"code\":\"OK\",\"message\":\"\",\"data\":{\"currency\":\"USD\",\"balance\":\"123.456789\",\"min_balance\":\"0\",\"suspended\":false,\"billing_exempt\":false,\"today_cost\":\"1.5\",\"week_cost\":\"12.25\"}}",
+    "iv_hex": "404142434445464748494a4b",
+    "aad": "GW1-RESP\ngwak_7c3e910a5bd24418e62f83c9\nc4a1f09e2b7d4e6385a0d9f1b3e27c58",
+    "payload": "QEFCQ0RFRkdISUpLkdr0DP9//5lhdT73AgHWQiJAq8acU9OwEP8EibF0qnJnikGMroDwksZEc7eaoIdx6m1PNgd5TaYH/Ui05RRPIpE3YOIEdsxnxJFipe5VVBTHj8w01elxjQUFiNseVwjGv+M/jce4QYxb++VNEyCBv3A9pL/yzyl+7x1gFxq/6DZTGlBHJ3e+nq/sp7W3io1enPOc9Xg6E/VsyfsuBWc4WP3gxJsFjDfutBht4GQqOFbx+QDQiA/T/YmzWRCk"
+  },
+  "hook": {
+    "note": "推送尚未开放，格式先行固定",
+    "timestamp": "1792647000",
+    "event_id": "evt_5b2e9d0c7a314f68",
+    "plaintext": "{\"event_id\":\"evt_5b2e9d0c7a314f68\",\"type\":\"balance.low\",\"created_at\":\"1792647000\",\"data\":{\"balance\":\"4.200000\",\"threshold\":\"5\"}}",
+    "iv_hex": "606162636465666768696a6b",
+    "aad": "GW1-HOOK\ngwak_7c3e910a5bd24418e62f83c9\n1792647000\nevt_5b2e9d0c7a314f68",
+    "payload": "YGFiY2RlZmdoaWpr7PF8JqzUDkG2Z0FGijWV3pGOdzwEfrjuKYcx8ZcZXrvjGhtIOXxhxRlU6KJPa6amcshoFHlv7tlxeD6rWNGQerPM5wn1EC/dRu7yulSw/oZVBnCEdaN5c+V4nzFkLP1GNINJ1ECGeP/Byia19aU6Ce05gLsCj5vUPPVDcY4EU24zMZC6euo+aggPbD2D32oP"
+  },
+  "must_fail": [
+    "SK 换成 0x11..0x30 后派生的 req_key 解密 request.payload",
+    "request.aad 中 timestamp 改为 1792646401",
+    "request.aad 中 path 改为 /open/v1/nodes/query",
+    "把 request.payload 当作响应，用 resp_key 和 response.aad 解密",
+    "把 response.payload 当作推送，用 hook.aad 解密"
+  ]
+}

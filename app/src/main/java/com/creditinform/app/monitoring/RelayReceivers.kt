@@ -19,9 +19,8 @@ class RelayBootReceiver : BroadcastReceiver() {
 class AlertActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         if (intent?.action != ACTION_DISMISS) return
-        intent.getStringExtra(EXTRA_ALERT_ID)?.let { id ->
-            AlarmController.dismiss(context, id)
-        }
+        // Acknowledging one alert clears them all so a burst never needs one tap per alert.
+        AlarmController.dismissAll(context)
     }
 
     companion object {

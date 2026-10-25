@@ -32,6 +32,8 @@ import java.text.DateFormat
 class RelayService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var repository: RelayRepository
+    // Health alarms already sounded during the current outage; cleared once the check recovers.
+    private val raisedStatusAlarms = mutableSetOf<String>()
 
     override fun onCreate() {
         super.onCreate()
@@ -59,6 +61,7 @@ class RelayService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_DISABLE) {
             repository.setEnabled(false)
+            AlarmController.dismissAll(this)
             cancelScheduledRestart(this)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -88,6 +91,7 @@ class RelayService : Service() {
     }
 
     private suspend fun runRelayLoop(config: RelayConfig) {
+        raisedStatusAlarms.clear()
         replayPendingEvents(config)
         var consecutiveFailures = 0
         var consecutiveConfigFailures = 0
@@ -99,7 +103,7 @@ class RelayService : Service() {
                     registered = true
                     consecutiveFailures = 0
                     nextHeartbeatAt = SystemClock.elapsedRealtime() + HEARTBEAT_INTERVAL_MS
-                    AlarmController.dismiss(this, AlarmController.RELAY_HEALTH_ALERT_ID)
+                    clearStatusAlarm(AlarmController.RELAY_HEALTH_ALERT_ID)
                 }
                 .onFailure { error ->
                     consecutiveFailures++
@@ -121,17 +125,14 @@ class RelayService : Service() {
                     // Advance only after every relevant event is durably stored and sounded.
                     repository.acknowledgeThrough(config, poll)
                     consecutiveFailures = 0
-                    AlarmController.dismiss(this, AlarmController.RELAY_HEALTH_ALERT_ID)
+                    clearStatusAlarm(AlarmController.RELAY_HEALTH_ALERT_ID)
                     repository.refreshMonitors()
                         .onSuccess { result ->
                             val configError = result.config.lastError.takeIf { it.isNotBlank() }
                                 ?: "服务端监控配置未加载".takeUnless { result.config.loaded }
                             if (configError == null) {
                                 consecutiveConfigFailures = 0
-                                AlarmController.dismiss(
-                                    this,
-                                    AlarmController.RELAY_CONFIG_ALERT_ID
-                                )
+                                clearStatusAlarm(AlarmController.RELAY_CONFIG_ALERT_ID)
                             } else {
                                 consecutiveConfigFailures++
                                 maybeTriggerConfigAlarm(
@@ -216,8 +217,7 @@ class RelayService : Service() {
         error: Throwable
     ) {
         if (consecutiveFailures < HEALTH_ALARM_FAILURES) return
-        AlarmController.triggerUrgent(
-            this,
+        raiseStatusAlarm(
             UrgentAlarm(
                 id = AlarmController.RELAY_HEALTH_ALERT_ID,
                 title = "报警通道离线",
@@ -239,8 +239,7 @@ class RelayService : Service() {
         error: String
     ) {
         if (consecutiveFailures < HEALTH_ALARM_FAILURES) return
-        AlarmController.triggerUrgent(
-            this,
+        raiseStatusAlarm(
             UrgentAlarm(
                 id = AlarmController.RELAY_CONFIG_ALERT_ID,
                 title = "服务端监控配置异常",
@@ -254,6 +253,20 @@ class RelayService : Service() {
                 ringtoneUri = config.ringtoneUri
             )
         )
+    }
+
+    private fun raiseStatusAlarm(alarm: UrgentAlarm) {
+        // A retry that was already in flight must not ring after communication is turned off.
+        if (!repository.config.value.enabled) return
+        // Once the user has acknowledged it, stay quiet until recovery instead of ringing every retry.
+        if (alarm.id in raisedStatusAlarms && !AlarmController.isActive(alarm.id)) return
+        raisedStatusAlarms += alarm.id
+        AlarmController.triggerUrgent(this, alarm)
+    }
+
+    private fun clearStatusAlarm(alertId: String) {
+        raisedStatusAlarms -= alertId
+        AlarmController.dismiss(this, alertId)
     }
 
     private fun updateServiceNotification() {
@@ -337,6 +350,7 @@ class RelayService : Service() {
         fun disable(context: Context) {
             val appContext = context.applicationContext
             RelayRepository.get(appContext).setEnabled(false)
+            AlarmController.dismissAll(appContext)
             cancelScheduledRestart(appContext)
             appContext.stopService(Intent(appContext, RelayService::class.java))
         }

@@ -450,6 +450,7 @@ private fun RelayAlarmApp() {
             onSaveAndTest = { candidate ->
                 showConfiguration = false
                 repository.saveConfig(candidate)
+                if (!candidate.enabled) AlarmController.dismissAll(context)
                 runCatching { RelayService.sync(context) }
                 if (candidate.enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
                     ContextCompat.checkSelfPermission(

@@ -1,0 +1,32 @@
+{
+  "groups": [
+    {
+      "id": "customer-service",
+      "sharedToken": "replace-with-a-long-random-token"
+    }
+  ],
+  "monitors": [
+    {
+      "id": "gateway-balance",
+      "groupId": "customer-service",
+      "name": "GateWay 余额（美元）",
+      "provider": "gateway",
+      "url": "https://op.privapi.cc/open/v1/balance/query",
+      "method": "POST",
+      "gatewayAccessKey": "gwak_replace_with_your_24_hex",
+      "gatewaySecretKeyEnv": "GATEWAY_SK",
+      "headers": {},
+      "body": {},
+      "jsonPath": "data.balance",
+      "operator": "<",
+      "threshold": 10,
+      "multiplier": 1,
+      "offset": 0,
+      "pollIntervalSeconds": 60,
+      "timeoutSeconds": 10,
+      "errorThreshold": 3,
+      "repeatAlertSeconds": 300,
+      "enabled": false
+    }
+  ]
+}

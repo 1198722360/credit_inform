@@ -37,7 +37,9 @@ data class RelayConfig(
     )
 
     companion object {
-        const val DEFAULT_SERVER_URL = "http://15.204.246.22:8047"
+        const val DEFAULT_SERVER_URL = "http://70.39.195.177:8047"
+        // Previous default deployments; saved configs still pointing here follow the move.
+        private val RETIRED_SERVER_URLS = setOf("http://15.204.246.22:8047")
         const val INTERNAL_GROUP_ID = "customer-service"
         const val INTERNAL_DEVICE_NAME = "Android 客户端"
         const val MAX_NAME_LENGTH = 128
@@ -47,6 +49,9 @@ data class RelayConfig(
         fun isValidIdentifier(value: String): Boolean = IDENTIFIER_PATTERN.matches(value)
 
         fun isValidGroupId(value: String): Boolean = isValidIdentifier(value)
+
+        fun migrateServerUrl(value: String): String =
+            if (value.trim().trimEnd('/') in RETIRED_SERVER_URLS) DEFAULT_SERVER_URL else value
 
         fun freshInstall(): RelayConfig = RelayConfig(
             serverUrl = DEFAULT_SERVER_URL,
@@ -222,7 +227,10 @@ data class RemoteMonitorConfig(
     val timeoutSeconds: Int,
     val errorThreshold: Int,
     val repeatAlertSeconds: Long,
-    val enabled: Boolean
+    val enabled: Boolean,
+    val provider: String = "http",
+    val gatewayAccessKey: String = "",
+    val gatewaySecretKeyEnv: String = "GATEWAY_SK"
 ) {
     companion object {
         const val KEEP_PLACEHOLDER = "__KEEP__"
@@ -248,7 +256,10 @@ data class RemoteMonitorUpsertRequest(
     val repeatAlertSeconds: Long = 300,
     val enabled: Boolean = true,
     /** Send the current revision on updates; null means no optimistic concurrency check. */
-    val revision: Long? = null
+    val revision: Long? = null,
+    val provider: String = "http",
+    val gatewayAccessKey: String = "",
+    val gatewaySecretKeyEnv: String = "GATEWAY_SK"
 )
 
 data class RemoteMonitorConfigsResult(

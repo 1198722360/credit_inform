@@ -81,7 +81,12 @@ class RelayRepository private constructor(context: Context) {
             }
         }
         // Rewriting also migrates legacy channelId/encryptedToken settings to the current schema.
-        persistConfig(_config.value)
+        if (storedConfigUsesRetiredServer()) {
+            // The relay moved hosts; start at the new server's head instead of replaying a backlog.
+            persistConfigAndResetDeliveryLocked(_config.value)
+        } else {
+            persistConfig(_config.value)
+        }
     }
 
     fun saveConfig(value: RelayConfig) = synchronized(connectionTransitionLock) {
@@ -89,15 +94,19 @@ class RelayRepository private constructor(context: Context) {
             val normalized = value.normalized()
             val previous = _config.value
             val identityChanged = !sameIdentity(previous, normalized)
+            val enabledChanged = previous.enabled != normalized.enabled
             val adminIdentityChanged = !sameAdminIdentity(previous, normalized)
 
+            if (identityChanged || enabledChanged) {
+                // Alerts raised while communication was off are skipped, not replayed on re-enable.
+                persistConfigAndResetDeliveryLocked(normalized)
+            } else {
+                persistConfig(normalized)
+            }
             if (identityChanged) {
-                persistConfigAndResetIdentityLocked(normalized)
                 remoteMonitorSnapshotGate.reset()
                 _monitorStatuses.value = emptyList()
                 _monitorConfigStatus.value = RemoteMonitorConfigStatus(false, 0, "")
-            } else {
-                persistConfig(normalized)
             }
             if (adminIdentityChanged) _remoteMonitorConfigs.value = emptyList()
             // Publish only after identity-bound local state has been reset.
@@ -304,6 +313,12 @@ class RelayRepository private constructor(context: Context) {
         if (updated.size == _pendingEvents.value.size) return@synchronized
         persistPendingEvents(updated)
         _pendingEvents.value = updated
+    }
+
+    fun acknowledgeAllLocally() = synchronized(lock) {
+        if (_pendingEvents.value.isEmpty()) return@synchronized
+        persistPendingEvents(emptyList())
+        _pendingEvents.value = emptyList()
     }
 
     suspend fun refreshMonitors(): Result<RemoteMonitorsResult> = withContext(Dispatchers.IO) {
@@ -672,7 +687,7 @@ class RelayRepository private constructor(context: Context) {
                 .ifBlank { json.optString("encryptedToken") }
             val encryptedAdminToken = json.optString("encryptedAdminToken")
             RelayConfig(
-                serverUrl = json.optString("serverUrl"),
+                serverUrl = RelayConfig.migrateServerUrl(json.optString("serverUrl")),
                 sharedToken = decryptSecret(encryptedSharedToken).ifBlank {
                     json.optString("sharedToken").ifBlank { json.optString("authToken") }
                 },
@@ -687,6 +702,13 @@ class RelayRepository private constructor(context: Context) {
                 ringtoneUri = json.optString("ringtoneUri")
             ).normalized()
         }.getOrElse { RelayConfig() }
+    }
+
+    private fun storedConfigUsesRetiredServer(): Boolean {
+        val storedUrl = runCatching {
+            JSONObject(preferences.getString(KEY_CONFIG, "{}") ?: "{}").optString("serverUrl")
+        }.getOrDefault("")
+        return RelayConfig.migrateServerUrl(storedUrl) != storedUrl
     }
 
     private fun configJson(value: RelayConfig): JSONObject = JSONObject().apply {
@@ -707,7 +729,7 @@ class RelayRepository private constructor(context: Context) {
         }
     }
 
-    private fun persistConfigAndResetIdentityLocked(value: RelayConfig) {
+    private fun persistConfigAndResetDeliveryLocked(value: RelayConfig) {
         check(
             preferences.edit()
                 .putString(KEY_CONFIG, configJson(value).toString())

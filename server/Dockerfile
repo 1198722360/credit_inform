@@ -1,7 +1,9 @@
 FROM python:3.12-alpine
 
 WORKDIR /app
-COPY relay_server.py /app/relay_server.py
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+COPY relay_server.py gateway_client.py admin_web.html /app/
 
 RUN addgroup -S -g 10001 relay && adduser -S -D -H -u 10001 -G relay relay \
     && mkdir -p /app/data /app/config \

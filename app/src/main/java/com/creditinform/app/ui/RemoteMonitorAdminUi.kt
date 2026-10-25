@@ -65,6 +65,11 @@ fun RemoteMonitorEditorScreen(
     var urlBase by rememberSaveable(existing?.id) { mutableStateOf(initialUrl.baseUrl) }
     var queryFields by remember(existing?.id) { mutableStateOf(initialUrl.queryFields) }
     var method by rememberSaveable(existing?.id) { mutableStateOf(existing?.method ?: "GET") }
+    var provider by rememberSaveable(existing?.id) { mutableStateOf(existing?.provider ?: "http") }
+    var gatewayAccessKey by rememberSaveable(existing?.id) { mutableStateOf(existing?.gatewayAccessKey.orEmpty()) }
+    var gatewaySecretKeyEnv by rememberSaveable(existing?.id) {
+        mutableStateOf(existing?.gatewaySecretKeyEnv ?: "GATEWAY_SK")
+    }
     var headerFields by remember(existing?.id) {
         mutableStateOf(parseSecretObject(existing?.headersJson))
     }
@@ -126,6 +131,49 @@ fun RemoteMonitorEditorScreen(
 
         item { EditorSectionTitle("接口") }
         item {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("http" to "普通 HTTP", "gateway" to "GateWay").forEach { (value, label) ->
+                    FilterChip(
+                        selected = provider == value,
+                        onClick = {
+                            provider = value
+                            if (value == "gateway") {
+                                method = "POST"
+                                if (urlBase.isBlank()) urlBase = "https://op.privapi.cc/open/v1/balance/query"
+                                if (jsonPath.isBlank()) jsonPath = "data.balance"
+                                if (name.isBlank()) name = "GateWay 余额"
+                                if ((pollText.toLongOrNull() ?: 0) < 30) pollText = "60"
+                            }
+                        },
+                        label = { Text(label) }
+                    )
+                }
+            }
+        }
+        if (provider == "gateway") {
+            item {
+                OutlinedTextField(
+                    value = gatewayAccessKey,
+                    onValueChange = { gatewayAccessKey = it },
+                    label = { Text("GateWay Access Key（AK）") },
+                    placeholder = { Text("gwak_…") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            item {
+                OutlinedTextField(
+                    value = gatewaySecretKeyEnv,
+                    onValueChange = { gatewaySecretKeyEnv = it },
+                    label = { Text("服务器 SK 环境变量名") },
+                    supportingText = { Text("默认 GATEWAY_SK。SK 的值只在服务器上设置。") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            item { Text("服务端自动加密请求和解密响应。余额字段为 data.balance，单位为美元，倍率填 1；检测间隔至少 30 秒。") }
+        }
+        item {
             OutlinedTextField(
                 value = name,
                 onValueChange = { name = it },
@@ -154,7 +202,7 @@ fun RemoteMonitorEditorScreen(
                 modifier = Modifier.fillMaxWidth()
             )
         }
-        item {
+        if (provider != "gateway") item {
             SecretFieldList(
                 title = "查询参数",
                 fields = queryFields,
@@ -163,7 +211,7 @@ fun RemoteMonitorEditorScreen(
                 onChange = { queryFields = it }
             )
         }
-        item {
+        if (provider != "gateway") item {
             Row(
                 modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -178,8 +226,8 @@ fun RemoteMonitorEditorScreen(
             }
         }
 
-        item { EditorSectionTitle("请求凭据") }
-        item {
+        item { EditorSectionTitle(if (provider == "gateway") "业务参数（可留空）" else "请求凭据") }
+        if (provider != "gateway") item {
             SecretFieldList(
                 title = "请求头",
                 fields = headerFields,
@@ -392,8 +440,8 @@ fun RemoteMonitorEditorScreen(
                     validationError = validateEditor(
                         name = name,
                         urlBase = urlBase,
-                        queryFields = queryFields,
-                        headerFields = headerFields,
+                        queryFields = if (provider == "gateway") emptyList() else queryFields,
+                        headerFields = if (provider == "gateway") emptyList() else headerFields,
                         jsonPath = jsonPath,
                         threshold = threshold,
                         multiplier = multiplier,
@@ -405,17 +453,33 @@ fun RemoteMonitorEditorScreen(
                         replaceBody = bodyMode == RequestBodyDraftMode.REPLACE,
                         body = body
                     )
+                    if (validationError.isEmpty() && provider == "gateway") {
+                        val uri = runCatching { URI(urlBase.trim()) }.getOrNull()
+                        validationError = when {
+                            !Regex("gwak_[0-9a-f]{24}").matches(gatewayAccessKey.trim()) -> "AK 格式应为 gwak_ 加 24 位十六进制字符"
+                            !Regex("(?!gwsk_)[A-Za-z_][A-Za-z0-9_]{0,127}").matches(gatewaySecretKeyEnv.trim()) -> "请填写服务器 SK 环境变量名，不要填写 SK 的值"
+                            uri == null || uri.scheme != "https" || uri.rawQuery != null || uri.rawFragment != null || uri.rawUserInfo != null ||
+                                uri.rawPath !in listOf("balance", "nodes", "logs", "bans").map { "/open/v1/$it/query" } ->
+                                "GateWay 必须使用 HTTPS 和文档中的完整接口路径，不带查询参数"
+                            poll!! < 30 -> "GateWay 检测间隔不能少于 30 秒"
+                            bodyMode == RequestBodyDraftMode.REPLACE && runCatching { JSONObject(body) }.isFailure -> "GateWay 业务参数必须是 JSON 对象，例如 {}"
+                            else -> ""
+                        }
+                    }
                     if (validationError.isEmpty()) {
                         val requestUrl = buildMonitorUrl(
                             baseUrl = urlBase,
-                            queryFields = queryFields
+                            queryFields = if (provider == "gateway") emptyList() else queryFields
                         )
                         onSave(
                             RemoteMonitorUpsertRequest(
                                 name = name.trim(),
                                 url = requestUrl,
-                                method = method,
-                                headersJson = secretFieldsToJson(headerFields),
+                                method = if (provider == "gateway") "POST" else method,
+                                provider = provider,
+                                gatewayAccessKey = gatewayAccessKey.trim(),
+                                gatewaySecretKeyEnv = gatewaySecretKeyEnv.trim(),
+                                headersJson = if (provider == "gateway") "{}" else secretFieldsToJson(headerFields),
                                 body = body.takeIf {
                                     bodyMode == RequestBodyDraftMode.REPLACE
                                 },
