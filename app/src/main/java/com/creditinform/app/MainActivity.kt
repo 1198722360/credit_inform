@@ -1231,7 +1231,7 @@ private fun RelayConfigurationDialog(
             Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("从 sub2api 获取上游余额和报警规则。上游密钥保留在服务器，手机只保存余额查询令牌。")
                 OutlinedTextField(value = serverUrl, onValueChange = { serverUrl = it },
-                    label = { Text("sub2api 地址（HTTPS）") }, singleLine = true,
+                    label = { Text("sub2api 地址（HTTP / HTTPS）") }, singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
                 OutlinedTextField(value = apiToken, onValueChange = { apiToken = it },
                     label = { Text("余额查询令牌") }, singleLine = true,
