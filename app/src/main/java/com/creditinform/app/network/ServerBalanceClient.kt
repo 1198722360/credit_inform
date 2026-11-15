@@ -63,9 +63,9 @@ class ServerBalanceClient {
             require(value.length <= 2048)
             val uri = URI(value)
             require(!uri.host.isNullOrBlank() && uri.userInfo == null && uri.rawQuery == null && uri.rawFragment == null)
-            // Plain HTTP is restricted to loopback for local integration tests and SSH tunnels.
-            require(uri.scheme == "https" || (uri.scheme == "http" && uri.host in setOf("localhost", "127.0.0.1", "[::1]", "::1"))) {
-                "服务器地址须使用 HTTPS"
+            // Direct server IP deployments may use HTTP with the server-side token/IP allowlist.
+            require(uri.scheme in setOf("https", "http")) {
+                "服务器地址须使用 HTTP 或 HTTPS"
             }
             return uri
         }

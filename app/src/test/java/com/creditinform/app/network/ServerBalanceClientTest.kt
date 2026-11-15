@@ -44,11 +44,12 @@ class ServerBalanceClientTest {
         } }
     }
 
-    @Test fun `rejects public cleartext and embedded credentials`() {
-        listOf("http://balance.example", "https://user:password@balance.example", "https://balance.example?token=secret", "https://balance.example/#secret").forEach {
+    @Test fun `accepts direct IP HTTP but rejects embedded credentials and invalid schemes`() {
+        listOf("ftp://balance.example", "https://user:password@balance.example", "https://balance.example?token=secret", "https://balance.example/#secret").forEach {
             assertTrue(runCatching { ServerBalanceClient.validateServerUrl(it) }.isFailure)
         }
         assertNotNull(ServerBalanceClient.validateServerUrl("https://balance.example/sub2api"))
+        assertNotNull(ServerBalanceClient.validateServerUrl("http://104.238.222.175:18090"))
     }
 
     @Test fun `stale result cannot be treated as healthy balance`() {
