@@ -17,7 +17,6 @@ import com.creditinform.app.data.RelayAlertType
 import com.creditinform.app.data.RelayConfig
 import com.creditinform.app.data.RelayConnectionState
 import com.creditinform.app.data.RelayRepository
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -32,8 +31,7 @@ import java.text.DateFormat
 class RelayService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var repository: RelayRepository
-    // Health alarms already sounded during the current outage; cleared once the check recovers.
-    private val raisedStatusAlarms = mutableSetOf<String>()
+    private var storageAlarmRaised = false
 
     override fun onCreate() {
         super.onCreate()
@@ -56,6 +54,15 @@ class RelayService : Service() {
         }
         scope.launch { repository.status.collect { updateServiceNotification() } }
         scope.launch { repository.monitorStatuses.collect { updateServiceNotification() } }
+        scope.launch {
+            repository.pendingEvents.collect { events ->
+                events.forEach { event ->
+                    if (!AlarmController.isActive(AlarmController.RELAY_EVENT_ALERT_PREFIX + event.acknowledgementKey)) {
+                        triggerEvent(repository.config.value, event)
+                    }
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -91,91 +98,29 @@ class RelayService : Service() {
     }
 
     private suspend fun runRelayLoop(config: RelayConfig) {
-        raisedStatusAlarms.clear()
-        replayPendingEvents(config)
-        var consecutiveFailures = 0
-        var consecutiveConfigFailures = 0
-        var nextHeartbeatAt = SystemClock.elapsedRealtime() + HEARTBEAT_INTERVAL_MS
-        var registered = false
-        while (currentCoroutineContext().isActive && !registered) {
-            repository.register()
-                .onSuccess {
-                    registered = true
-                    consecutiveFailures = 0
-                    nextHeartbeatAt = SystemClock.elapsedRealtime() + HEARTBEAT_INTERVAL_MS
-                    clearStatusAlarm(AlarmController.RELAY_HEALTH_ALERT_ID)
-                }
-                .onFailure { error ->
-                    consecutiveFailures++
-                    maybeTriggerHealthAlarm(config, consecutiveFailures, error)
-                    delay(RETRY_DELAY_MS)
-                }
-        }
-
         while (currentCoroutineContext().isActive) {
-            val result = repository.pollOnce(POLL_SECONDS)
-            result.onSuccess { poll ->
-                try {
-                    if (!poll.cursorValid) {
-                        consecutiveFailures = 0
-                        return@onSuccess
-                    }
-                    // Persist first. A process killed after this point will replay pending events.
-                    repository.processPendingEvents(config, poll) { triggerEvent(config, it) }
-                    // Advance only after every relevant event is durably stored and sounded.
-                    repository.acknowledgeThrough(config, poll)
-                    consecutiveFailures = 0
-                    clearStatusAlarm(AlarmController.RELAY_HEALTH_ALERT_ID)
-                    repository.refreshMonitors()
-                        .onSuccess { result ->
-                            val configError = result.config.lastError.takeIf { it.isNotBlank() }
-                                ?: "服务端监控配置未加载".takeUnless { result.config.loaded }
-                            if (configError == null) {
-                                consecutiveConfigFailures = 0
-                                clearStatusAlarm(AlarmController.RELAY_CONFIG_ALERT_ID)
-                            } else {
-                                consecutiveConfigFailures++
-                                maybeTriggerConfigAlarm(
-                                    config,
-                                    consecutiveConfigFailures,
-                                    configError
-                                )
-                            }
-                        }
-                        .onFailure { error ->
-                            consecutiveConfigFailures++
-                            maybeTriggerConfigAlarm(
-                                config,
-                                consecutiveConfigFailures,
-                                error.readableMessage()
-                            )
-                        }
-                    if (SystemClock.elapsedRealtime() >= nextHeartbeatAt) {
-                        repository.heartbeat()
-                        nextHeartbeatAt = SystemClock.elapsedRealtime() + HEARTBEAT_INTERVAL_MS
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Exception) {
-                    consecutiveFailures++
-                    maybeTriggerHealthAlarm(config, consecutiveFailures, error)
-                    delay(RETRY_DELAY_MS)
+            scheduleRestart(this@RelayService)
+            repository.checkDueMonitors().onSuccess {
+                if (storageAlarmRaised) {
+                    storageAlarmRaised = false
+                    AlarmController.dismiss(this, AlarmController.RELAY_CONFIG_ALERT_ID)
                 }
             }.onFailure { error ->
-                consecutiveFailures++
-                maybeTriggerHealthAlarm(config, consecutiveFailures, error)
-                delay(RETRY_DELAY_MS)
+                if (repository.config.value.enabled) {
+                    val id = AlarmController.RELAY_CONFIG_ALERT_ID
+                    if (!storageAlarmRaised) AlarmController.triggerUrgent(this,
+                        UrgentAlarm(id, "本机监控异常", "无法执行或保存本机检测", error.message.orEmpty(),
+                            soundEnabled = config.soundEnabled, vibrateEnabled = config.vibrateEnabled,
+                            alarmVolumePercent = config.alarmVolumePercent, ringtoneUri = config.ringtoneUri))
+                    storageAlarmRaised = true
+                }
             }
+            delay(1_000)
         }
     }
 
-    private fun replayPendingEvents(config: RelayConfig) {
-        repository.pendingEvents.value
-            .filter { it.senderId != config.deviceId }
-            .forEach { triggerEvent(config, it) }
-    }
-
-    private fun triggerEvent(config: RelayConfig, event: RelayAlarmEvent) {
+    private fun triggerEvent(config: RelayConfig, event: RelayAlarmEvent) = synchronized(AlarmController) {
+        if (!repository.config.value.enabled || repository.pendingEvents.value.none { it.acknowledgementKey == event.acknowledgementKey }) return
         val monitorName = event.monitorName?.takeIf { it.isNotBlank() }
         val title = when (event.type) {
             RelayAlertType.MANUAL -> "人工紧急报警"
@@ -183,7 +128,7 @@ class RelayService : Service() {
             RelayAlertType.MONITOR_ERROR -> "服务检测异常"
             RelayAlertType.UNKNOWN -> "紧急报警"
         }
-        val sender = event.senderName.ifBlank { "对方客户端" }
+        val sender = event.senderName.ifBlank { "本机" }
         val message = when {
             monitorName != null -> "$monitorName：${event.message}"
             else -> "$sender：${event.message}"
@@ -198,8 +143,8 @@ class RelayService : Service() {
                 title = title,
                 message = message,
                 detail = buildString {
-                    append("发送方：$sender")
-                    sentAt?.let { append("\n发送时间：$it") }
+                    append("来源：$sender")
+                    sentAt?.let { append("\n检测时间：$it") }
                 },
                 notificationTitle = "$title：$sender",
                 notificationText = event.message,
@@ -209,64 +154,6 @@ class RelayService : Service() {
                 ringtoneUri = config.ringtoneUri
             )
         )
-    }
-
-    private fun maybeTriggerHealthAlarm(
-        config: RelayConfig,
-        consecutiveFailures: Int,
-        error: Throwable
-    ) {
-        if (consecutiveFailures < HEALTH_ALARM_FAILURES) return
-        raiseStatusAlarm(
-            UrgentAlarm(
-                id = AlarmController.RELAY_HEALTH_ALERT_ID,
-                title = "报警通道离线",
-                message = "无法连接中转服务器",
-                detail = "已连续失败 $consecutiveFailures 次\n${error.readableMessage()}",
-                notificationTitle = "报警通道离线",
-                notificationText = "中转服务器连续 $consecutiveFailures 次连接失败",
-                soundEnabled = config.soundEnabled,
-                vibrateEnabled = config.vibrateEnabled,
-                alarmVolumePercent = config.alarmVolumePercent,
-                ringtoneUri = config.ringtoneUri
-            )
-        )
-    }
-
-    private fun maybeTriggerConfigAlarm(
-        config: RelayConfig,
-        consecutiveFailures: Int,
-        error: String
-    ) {
-        if (consecutiveFailures < HEALTH_ALARM_FAILURES) return
-        raiseStatusAlarm(
-            UrgentAlarm(
-                id = AlarmController.RELAY_CONFIG_ALERT_ID,
-                title = "服务端监控配置异常",
-                message = "定时测活配置未正常运行",
-                detail = "已连续异常 $consecutiveFailures 次\n${error.take(300)}",
-                notificationTitle = "服务端监控配置异常",
-                notificationText = "定时测活配置连续 $consecutiveFailures 次异常",
-                soundEnabled = config.soundEnabled,
-                vibrateEnabled = config.vibrateEnabled,
-                alarmVolumePercent = config.alarmVolumePercent,
-                ringtoneUri = config.ringtoneUri
-            )
-        )
-    }
-
-    private fun raiseStatusAlarm(alarm: UrgentAlarm) {
-        // A retry that was already in flight must not ring after communication is turned off.
-        if (!repository.config.value.enabled) return
-        // Once the user has acknowledged it, stay quiet until recovery instead of ringing every retry.
-        if (alarm.id in raisedStatusAlarms && !AlarmController.isActive(alarm.id)) return
-        raisedStatusAlarms += alarm.id
-        AlarmController.triggerUrgent(this, alarm)
-    }
-
-    private fun clearStatusAlarm(alertId: String) {
-        raisedStatusAlarms -= alertId
-        AlarmController.dismiss(this, alertId)
     }
 
     private fun updateServiceNotification() {
@@ -283,10 +170,10 @@ class RelayService : Service() {
         val monitorCount = repository.monitorStatuses.value.count { it.enabled }
         val detail = when (status.state) {
             RelayConnectionState.ONLINE ->
-                "服务端在线，${status.onlineClients} 个客户端，$monitorCount 个监控端点"
-            RelayConnectionState.CHECKING -> "正在连接报警服务器"
-            RelayConnectionState.OFFLINE -> status.lastError.ifBlank { "报警服务器离线" }
-            RelayConnectionState.DISABLED -> "报警通信未启用"
+                "本机正在监控 $monitorCount 个业务接口"
+            RelayConnectionState.CHECKING -> "正在启动本机监控"
+            RelayConnectionState.OFFLINE -> status.lastError.ifBlank { "本机监控异常" }
+            RelayConnectionState.DISABLED -> "本机监控未启用"
         }
         val openApp = PendingIntent.getActivity(
             this,
@@ -309,7 +196,7 @@ class RelayService : Service() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setContentIntent(openApp)
-            .addAction(android.R.drawable.ic_media_pause, "停用通信", disable)
+            .addAction(android.R.drawable.ic_media_pause, "停止监控", disable)
             .apply {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     setForegroundServiceBehavior(Notification.FOREGROUND_SERVICE_IMMEDIATE)
@@ -328,10 +215,6 @@ class RelayService : Service() {
         private const val RESTART_REQUEST_CODE = 1_002
         private const val WATCHDOG_INTERVAL_MS = 30_000L
         private const val RESTART_DELAY_MS = 2_000L
-        private const val RETRY_DELAY_MS = 5_000L
-        private const val POLL_SECONDS = 25
-        private const val HEARTBEAT_INTERVAL_MS = 60_000L
-        private const val HEALTH_ALARM_FAILURES = 3
 
         fun sync(context: Context) {
             val appContext = context.applicationContext

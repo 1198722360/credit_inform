@@ -47,7 +47,7 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Authenticated relay polling, server monitor status synchronization, and urgent full-screen alarms" />
+                android:value="On-device business endpoint monitoring and urgent local full-screen alarms" />
         </service>
 
         <receiver

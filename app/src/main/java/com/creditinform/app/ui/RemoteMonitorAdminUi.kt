@@ -67,8 +67,8 @@ fun RemoteMonitorEditorScreen(
     var method by rememberSaveable(existing?.id) { mutableStateOf(existing?.method ?: "GET") }
     var provider by rememberSaveable(existing?.id) { mutableStateOf(existing?.provider ?: "http") }
     var gatewayAccessKey by rememberSaveable(existing?.id) { mutableStateOf(existing?.gatewayAccessKey.orEmpty()) }
-    var gatewaySecretKeyEnv by rememberSaveable(existing?.id) {
-        mutableStateOf(existing?.gatewaySecretKeyEnv ?: "GATEWAY_SK")
+    var gatewaySecretKey by remember(existing?.id) {
+        mutableStateOf(existing?.gatewaySecretKey.orEmpty())
     }
     var headerFields by remember(existing?.id) {
         mutableStateOf(parseSecretObject(existing?.headersJson))
@@ -120,7 +120,7 @@ fun RemoteMonitorEditorScreen(
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (existing == null) "新增服务端监控" else "编辑服务端监控",
+                    if (existing == null) "新增本机监控" else "编辑本机监控",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.weight(1f)
@@ -163,15 +163,16 @@ fun RemoteMonitorEditorScreen(
             }
             item {
                 OutlinedTextField(
-                    value = gatewaySecretKeyEnv,
-                    onValueChange = { gatewaySecretKeyEnv = it },
-                    label = { Text("服务器 SK 环境变量名") },
-                    supportingText = { Text("默认 GATEWAY_SK。SK 的值只在服务器上设置。") },
+                    value = gatewaySecretKey,
+                    onValueChange = { gatewaySecretKey = it },
+                    label = { Text("GateWay Secret Key（SK）") },
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                    supportingText = { Text("SK 仅加密保存在此手机中，用于直连业务接口。") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
             }
-            item { Text("服务端自动加密请求和解密响应。余额字段为 data.balance，单位为美元，倍率填 1；检测间隔至少 30 秒。") }
+            item { Text("手机自动加密请求和解密响应。余额字段为 data.balance，单位为美元，倍率填 1；检测间隔至少 30 秒。") }
         }
         item {
             OutlinedTextField(
@@ -265,7 +266,7 @@ fun RemoteMonitorEditorScreen(
                 }
                 if (bodyMode == RequestBodyDraftMode.CLEAR) {
                     Text(
-                        "保存后将清除服务端请求体",
+                        "保存后将清除本机请求体",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error
                     )
@@ -457,7 +458,7 @@ fun RemoteMonitorEditorScreen(
                         val uri = runCatching { URI(urlBase.trim()) }.getOrNull()
                         validationError = when {
                             !Regex("gwak_[0-9a-f]{24}").matches(gatewayAccessKey.trim()) -> "AK 格式应为 gwak_ 加 24 位十六进制字符"
-                            !Regex("(?!gwsk_)[A-Za-z_][A-Za-z0-9_]{0,127}").matches(gatewaySecretKeyEnv.trim()) -> "请填写服务器 SK 环境变量名，不要填写 SK 的值"
+                            !Regex("gwsk_[A-Za-z0-9_-]{43}").matches(gatewaySecretKey.trim()) -> "请填写完整的 GateWay SK"
                             uri == null || uri.scheme != "https" || uri.rawQuery != null || uri.rawFragment != null || uri.rawUserInfo != null ||
                                 uri.rawPath !in listOf("balance", "nodes", "logs", "bans").map { "/open/v1/$it/query" } ->
                                 "GateWay 必须使用 HTTPS 和文档中的完整接口路径，不带查询参数"
@@ -478,7 +479,7 @@ fun RemoteMonitorEditorScreen(
                                 method = if (provider == "gateway") "POST" else method,
                                 provider = provider,
                                 gatewayAccessKey = gatewayAccessKey.trim(),
-                                gatewaySecretKeyEnv = gatewaySecretKeyEnv.trim(),
+                                gatewaySecretKey = gatewaySecretKey.trim(),
                                 headersJson = if (provider == "gateway") "{}" else secretFieldsToJson(headerFields),
                                 body = body.takeIf {
                                     bodyMode == RequestBodyDraftMode.REPLACE
@@ -499,7 +500,7 @@ fun RemoteMonitorEditorScreen(
                         )
                     }
                 }
-            ) { Text(if (saving) "保存中" else "保存到服务端") }
+            ) { Text(if (saving) "保存中" else "保存到本机") }
         }
         item { Spacer(Modifier.width(1.dp)) }
     }

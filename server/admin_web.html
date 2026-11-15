@@ -341,11 +341,21 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
             <p class="field-error" id="e-gateway-ak" hidden></p>
           </div>
           <div class="field">
-            <label for="f-gateway-sk-env">服务器 SK 环境变量名</label>
-            <input class="input" id="f-gateway-sk-env" type="text" autocomplete="off" spellcheck="false" placeholder="GATEWAY_SK" aria-describedby="h-gateway e-gateway-sk-env">
-            <p class="field-error" id="e-gateway-sk-env" hidden></p>
-            <p class="hint" id="h-gateway">SK 的值只在服务器环境变量中设置。服务端自动加密请求和解密响应；余额字段为 data.balance，单位为美元，倍率填 1，检测间隔至少 30 秒。</p>
+            <label for="f-gateway-sk">Secret Key（SK）</label>
+            <input class="input" id="f-gateway-sk" type="password" autocomplete="new-password" spellcheck="false" placeholder="gwsk_…" aria-describedby="h-gateway-sk e-gateway-sk">
+            <p class="field-error" id="e-gateway-sk" hidden></p>
+            <p class="hint" id="h-gateway-sk">填写与 AK 配套的 SK，保存后立即生效。密钥保存在服务端，不会回显。</p>
           </div>
+          <details>
+            <summary>高级：使用服务器环境变量</summary>
+            <div class="field">
+              <label for="f-gateway-sk-env">SK 环境变量名</label>
+              <input class="input" id="f-gateway-sk-env" type="text" autocomplete="off" spellcheck="false" placeholder="GATEWAY_SK" aria-describedby="e-gateway-sk-env">
+              <p class="field-error" id="e-gateway-sk-env" hidden></p>
+              <p class="hint">未保存 SK 时，使用此服务器环境变量中的密钥。</p>
+            </div>
+          </details>
+          <p class="hint" id="h-gateway">余额字段为 data.balance，单位为美元，倍率填 1，检测间隔至少 30 秒。</p>
         </div>
         <div class="field">
           <label for="f-name">名称</label>
@@ -548,7 +558,7 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
     toast: byId("toast"),
   };
   const fields = {
-    provider: byId("f-provider"), gatewayAccessKey: byId("f-gateway-ak"), gatewaySecretKeyEnv: byId("f-gateway-sk-env"),
+    provider: byId("f-provider"), gatewayAccessKey: byId("f-gateway-ak"), gatewaySecretKey: byId("f-gateway-sk"), gatewaySecretKeyEnv: byId("f-gateway-sk-env"),
     name: byId("f-name"), url: byId("f-url"), body: byId("f-body"), jsonPath: byId("f-json-path"),
     operator: byId("f-operator"), threshold: byId("f-threshold"),
     multiplier: byId("f-multiplier"), offset: byId("f-offset"),
@@ -558,6 +568,7 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
   // Validation keys in form order, so the first error found is also the first one on screen.
   const ERROR_SLOTS = {
     gatewayAccessKey: [fields.gatewayAccessKey, "e-gateway-ak"],
+    gatewaySecretKey: [fields.gatewaySecretKey, "e-gateway-sk"],
     gatewaySecretKeyEnv: [fields.gatewaySecretKeyEnv, "e-gateway-sk-env"],
     name: [fields.name, "e-name"], url: [fields.url, "e-url"], headers: [null, "e-headers"],
     body: [fields.body, "e-body"], jsonPath: [fields.jsonPath, "e-json-path"],
@@ -1200,7 +1211,7 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
 
   function formSnapshot() {
     return JSON.stringify([
-      fields.provider.value, fields.gatewayAccessKey.value, fields.gatewaySecretKeyEnv.value,
+      fields.provider.value, fields.gatewayAccessKey.value, fields.gatewaySecretKey.value, fields.gatewaySecretKeyEnv.value,
       fields.name.value, fields.url.value, currentMethod(), headerEntries(), fields.body.value,
       fields.jsonPath.value, fields.operator.value, fields.threshold.value,
       fields.multiplier.value, fields.offset.value, fields.poll.value, fields.timeout.value,
@@ -1213,6 +1224,11 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
   function fillForm(monitor) {
     fields.provider.value = monitor.provider || "http";
     fields.gatewayAccessKey.value = monitor.gatewayAccessKey || "";
+    fields.gatewaySecretKey.value = "";
+    fields.gatewaySecretKey.placeholder = monitor.gatewaySecretKeyConfigured ? "已保存，留空保持不变" : "gwsk_…";
+    byId("h-gateway-sk").textContent = monitor.gatewaySecretKeyConfigured
+      ? "SK 已保存在服务端。留空保持不变，填写新 SK 后保存即可更换。"
+      : "填写与 AK 配套的 SK，保存后立即生效。密钥保存在服务端，不会回显。";
     fields.gatewaySecretKeyEnv.value = monitor.gatewaySecretKeyEnv || "GATEWAY_SK";
     fields.name.value = monitor.name || "";
     fields.url.value = monitor.url || "";
@@ -1273,6 +1289,7 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
   }
 
   function closeEditor() {
+    fields.gatewaySecretKey.value = "";
     const id = state.editing ? state.editing.id : null;
     state.editing = null;
     state.editorBusy = false;
@@ -1304,6 +1321,7 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
     requestCloseEditor();
   });
   ui.editor.addEventListener("close", () => {
+    fields.gatewaySecretKey.value = "";
     state.editing = null;
     state.editorBusy = false;
   });
@@ -1508,6 +1526,8 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
     const errors = new Map();
     const gateway = fields.provider.value === "gateway";
     const gatewayAccessKey = fields.gatewayAccessKey.value.trim();
+    const gatewaySecretKey = fields.gatewaySecretKey.value.trim();
+    if (gateway && gatewaySecretKey && !/^gwsk_[A-Za-z0-9_-]{43}$/.test(gatewaySecretKey)) errors.set("gatewaySecretKey", "SK 格式应为 gwsk_ 加 43 位字母、数字、下划线或连字符。");
     const gatewaySecretKeyEnv = fields.gatewaySecretKeyEnv.value.trim();
     if (gateway && !/^gwak_[0-9a-f]{24}$/.test(gatewayAccessKey)) errors.set("gatewayAccessKey", "AK 格式应为 gwak_ 加 24 位十六进制字符。");
     if (gateway && !/^(?!gwsk_)[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(gatewaySecretKeyEnv)) errors.set("gatewaySecretKeyEnv", "请填写服务器环境变量名，例如 GATEWAY_SK，不要填写 SK 的值。");
@@ -1592,6 +1612,7 @@ dialog.confirm p { margin: 0 0 20px; color: var(--ink-soft); }
       repeatAlertSeconds: repeat, enabled: fields.enabled.checked,
     };
     if (body !== undefined) doc.body = body;
+    if (gateway && gatewaySecretKey) doc.gatewaySecretKey = gatewaySecretKey;
     return { errors: ordered, doc };
   }
 

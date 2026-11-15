@@ -38,7 +38,7 @@ object NotificationChannels {
             context.getString(R.string.alert_channel_name),
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "人工报警、服务端监控报警或通信离线时显示全屏紧急提醒"
+            description = "本机手动报警、接口越界或连续检测失败时显示全屏紧急提醒"
             lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
             setBypassDnd(true)
             // Sound and vibration are driven directly so the configured volume is respected.

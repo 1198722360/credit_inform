@@ -1,19 +1,26 @@
 package com.creditinform.app.data
 
 import android.content.Context
+import android.net.Uri
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import com.creditinform.app.network.RelayApi
+import com.creditinform.app.network.LocalMonitorClient
+import com.creditinform.app.network.RelayApiException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URI
 import java.security.KeyStore
 import java.util.UUID
 import javax.crypto.Cipher
@@ -21,772 +28,231 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
+/** All settings, monitor state and pending alarms belong to this device. */
 class RelayRepository private constructor(context: Context) {
-    private val preferences = context.applicationContext.getSharedPreferences(
-        PREFS_NAME,
-        Context.MODE_PRIVATE
-    )
-    private val api = RelayApi()
+    private val appContext = context.applicationContext
+    private val preferences = context.applicationContext.getSharedPreferences("credit_inform_relay", Context.MODE_PRIVATE)
     private val lock = Any()
-    private val connectionTransitionLock = Any()
-    private val remoteMonitorSnapshotGate = RemoteMonitorSnapshotGate()
-
+    private val checkMutex = Mutex()
+    private var configGeneration = 0L
+    private val client = LocalMonitorClient()
+    private var loadError = ""
+    private val initial = loadDocument()
     private val _config = MutableStateFlow(loadConfig())
-    val config: StateFlow<RelayConfig> = _config.asStateFlow()
-
-    private val _status = MutableStateFlow(
-        loadStatus().copy(
-            state = if (_config.value.enabled) {
-                RelayConnectionState.OFFLINE
-            } else {
-                RelayConnectionState.DISABLED
-            }
-        )
-    )
-    val status: StateFlow<RelayStatus> = _status.asStateFlow()
-
-    private val _monitorStatuses = MutableStateFlow<List<RemoteMonitorStatus>>(emptyList())
-    val monitorStatuses: StateFlow<List<RemoteMonitorStatus>> = _monitorStatuses.asStateFlow()
-
-    private val _monitorConfigStatus = MutableStateFlow(
-        RemoteMonitorConfigStatus(loaded = false, lastLoadedAt = 0, lastError = "")
-    )
-    val monitorConfigStatus: StateFlow<RemoteMonitorConfigStatus> =
-        _monitorConfigStatus.asStateFlow()
-
-    private val _remoteMonitorConfigs = MutableStateFlow<List<RemoteMonitorConfig>>(emptyList())
-    val remoteMonitorConfigs: StateFlow<List<RemoteMonitorConfig>> =
-        _remoteMonitorConfigs.asStateFlow()
-
-    private val _pendingEvents = MutableStateFlow(loadPendingEvents())
-    val pendingEvents: StateFlow<List<RelayAlarmEvent>> = _pendingEvents.asStateFlow()
-
-    private val _cursor = MutableStateFlow(preferences.getLong(KEY_CURSOR, 0L))
-    val cursor: StateFlow<Long> = _cursor.asStateFlow()
-
-    private val _cursorToken = MutableStateFlow(
-        preferences.getString(KEY_CURSOR_TOKEN, null).normalizedCursorToken()
-    )
-    val cursorToken: StateFlow<String?> = _cursorToken.asStateFlow()
-
-    private val _currentServerInstanceId = MutableStateFlow(
-        preferences.getString(KEY_SERVER_INSTANCE_ID, null).normalizedInstanceId()
-    )
-    val currentServerInstanceId: StateFlow<String?> = _currentServerInstanceId.asStateFlow()
+    val config = _config.asStateFlow()
+    private val _remoteMonitorConfigs = MutableStateFlow(readArray(initial.optJSONArray("monitors"), ::localMonitorFromJson))
+    val remoteMonitorConfigs = _remoteMonitorConfigs.asStateFlow()
+    private var states = initial.optJSONObject("states")?.let { j ->
+        j.keys().asSequence().associateWith { LocalMonitorState.fromJson(j.getJSONObject(it)) }
+    }.orEmpty()
+    private val _pendingEvents = MutableStateFlow(readArray(initial.optJSONArray("pending")) { it.toRelayAlarmEvent() })
+    val pendingEvents = _pendingEvents.asStateFlow()
+    private val _monitorStatuses = MutableStateFlow(_remoteMonitorConfigs.value.map { (states[it.id] ?: LocalMonitorState()).status(it) })
+    val monitorStatuses = _monitorStatuses.asStateFlow()
+    private val _monitorConfigStatus = MutableStateFlow(RemoteMonitorConfigStatus(loadError.isEmpty(), System.currentTimeMillis(), loadError))
+    val monitorConfigStatus = _monitorConfigStatus.asStateFlow()
+    private val _status = MutableStateFlow(RelayStatus())
+    val status = _status.asStateFlow()
 
     init {
-        if (!preferences.contains(KEY_CURSOR_INITIALIZED) && preferences.contains(KEY_CURSOR)) {
-            check(preferences.edit().putBoolean(KEY_CURSOR_INITIALIZED, true).commit()) {
-                "无法迁移报警游标状态"
-            }
-        }
-        // Rewriting also migrates legacy channelId/encryptedToken settings to the current schema.
-        if (storedConfigUsesRetiredServer()) {
-            // The relay moved hosts; start at the new server's head instead of replaying a backlog.
-            persistConfigAndResetDeliveryLocked(_config.value)
-        } else {
-            persistConfig(_config.value)
-        }
+        // Overwrite old connection settings without reading or using the old server credentials.
+        saveConfig(_config.value)
     }
 
-    fun saveConfig(value: RelayConfig) = synchronized(connectionTransitionLock) {
-        synchronized(lock) {
-            val normalized = value.normalized()
-            val previous = _config.value
-            val identityChanged = !sameIdentity(previous, normalized)
-            val enabledChanged = previous.enabled != normalized.enabled
-            val adminIdentityChanged = !sameAdminIdentity(previous, normalized)
-
-            if (identityChanged || enabledChanged) {
-                // Alerts raised while communication was off are skipped, not replayed on re-enable.
-                persistConfigAndResetDeliveryLocked(normalized)
-            } else {
-                persistConfig(normalized)
-            }
-            if (identityChanged) {
-                remoteMonitorSnapshotGate.reset()
-                _monitorStatuses.value = emptyList()
-                _monitorConfigStatus.value = RemoteMonitorConfigStatus(false, 0, "")
-            }
-            if (adminIdentityChanged) _remoteMonitorConfigs.value = emptyList()
-            // Publish only after identity-bound local state has been reset.
-            _config.value = normalized
-            _status.value = RelayStatus(
-                state = if (normalized.enabled) {
-                    RelayConnectionState.OFFLINE
-                } else {
-                    RelayConnectionState.DISABLED
-                }
-            )
-            persistStatus(_status.value)
+    private fun loadDocument(): JSONObject = try {
+        val document = preferences.getString("local_document_v1", null)?.let { JSONObject(decryptSecret(it)) } ?: JSONObject()
+        readArray(document.optJSONArray("monitors"), ::localMonitorFromJson)
+        readArray(document.optJSONArray("pending")) { it.toRelayAlarmEvent() }
+        document.optJSONObject("states")?.let { states ->
+            states.keys().forEach { LocalMonitorState.fromJson(states.getJSONObject(it)) }
         }
-    }
-
-    fun setEnabled(enabled: Boolean) {
-        saveConfig(config.value.copy(enabled = enabled))
-    }
-
-    suspend fun testConnection(candidate: RelayConfig = config.value): Result<RelayServerStatus> =
-        withContext(Dispatchers.IO) {
-            val normalized = candidate.normalized()
-            updateStatusIfCurrent(normalized) {
-                it.copy(state = RelayConnectionState.CHECKING, lastError = "")
-            }
-            relayResult(normalized) {
-                validateRelayConfig(normalized, requireEnabled = false)
-                val serverStatus = api.status(normalized)
-                val monitors = api.monitors(normalized)
-                recordRemoteMonitorsIfCurrent(normalized, monitors)
-                recordOnlineIfCurrent(
-                    candidate = normalized,
-                    onlineClients = serverStatus.onlineClients,
-                    totalClients = serverStatus.totalClients
-                )
-                serverStatus
-            }
-        }
-
-    suspend fun register(): Result<RelayRegistration> = withContext(Dispatchers.IO) {
-        val current = config.value
-        relayResult(current) {
-            validateRelayConfig(current)
-            api.register(current).also {
-                reconcileServerStateIfCurrent(
-                    candidate = current,
-                    serverInstanceId = it.serverInstanceId,
-                    serverCursor = it.cursor,
-                    serverCursorToken = it.cursorToken,
-                    cursorValid = true,
-                    initializeIfNeeded = true,
-                    checkCursorRegression = true
-                )
-                recordOnlineIfCurrent(current, it.onlineClients, it.totalClients)
-            }
-        }
-    }
-
-    suspend fun heartbeat(): Result<RelayRegistration> = withContext(Dispatchers.IO) {
-        val current = config.value
-        relayResult(current) {
-            validateRelayConfig(current)
-            api.heartbeat(current).also {
-                reconcileServerStateIfCurrent(
-                    candidate = current,
-                    serverInstanceId = it.serverInstanceId,
-                    serverCursor = it.cursor,
-                    serverCursorToken = it.cursorToken,
-                    cursorValid = true,
-                    initializeIfNeeded = true,
-                    checkCursorRegression = true
-                )
-                recordOnlineIfCurrent(current, it.onlineClients, it.totalClients)
-            }
-        }
-    }
-
-    suspend fun sendAlarm(message: String): Result<RelaySendResult> = withContext(Dispatchers.IO) {
-        val current = config.value
-        relayResult(current) {
-            validateRelayConfig(current)
-            val text = message.trim()
-            require(text.isNotEmpty()) { "报警内容不能为空" }
-            require(text.length <= MAX_MESSAGE_LENGTH) {
-                "报警内容不能超过 $MAX_MESSAGE_LENGTH 个字符"
-            }
-            api.sendAlarm(current, text).also { recordOnlineIfCurrent(current) }
-        }
-    }
-
-    suspend fun pollOnce(waitSeconds: Int = RelayApi.DEFAULT_POLL_SECONDS): Result<RelayPollResult> =
-        withContext(Dispatchers.IO) {
-            val current = config.value
-            relayResult(current) {
-                validateRelayConfig(current)
-                val (after, afterToken) = synchronized(lock) {
-                    _cursor.value to _cursorToken.value
-                }
-                val response = api.poll(
-                    config = current,
-                    after = after,
-                    afterToken = afterToken,
-                    waitSeconds = waitSeconds
-                )
-                if (!sameRelayConnection(current, config.value)) {
-                    throw CancellationException("通信配置已变更")
-                }
-                val reset = reconcileServerStateIfCurrent(
-                    candidate = current,
-                    serverInstanceId = response.serverInstanceId,
-                    serverCursor = response.headCursor,
-                    serverCursorToken = response.cursorToken,
-                    cursorValid = response.cursorValid,
-                    initializeIfNeeded = false,
-                    checkCursorRegression = true
-                )
-                recordOnlineIfCurrent(current)
-                if (reset) {
-                    response.copy(
-                        events = emptyList(),
-                        cursor = 0L,
-                        cursorToken = null,
-                        cursorValid = false
-                    )
-                } else {
-                    response
-                }
-            }
-        }
-
-    /** Store events before sounding them; commit [RelayPollResult.cursor] afterwards. */
-    fun processPendingEvents(
-        candidate: RelayConfig,
-        poll: RelayPollResult,
-        process: (RelayAlarmEvent) -> Unit
-    ) = synchronized(connectionTransitionLock) {
-        val events = synchronized(lock) {
-            recordPendingEventsLocked(candidate, poll)
-        }
-        events.forEach(process)
-    }
-
-    private fun recordPendingEventsLocked(
-        candidate: RelayConfig,
-        poll: RelayPollResult
-    ): List<RelayAlarmEvent> {
-        if (!sameRelayConnection(candidate, config.value)) return emptyList()
-        val currentInstanceId = _currentServerInstanceId.value
-        val responseInstanceId = poll.serverInstanceId.normalizedInstanceId()
-        if (responseInstanceId != currentInstanceId) return emptyList()
-        val existing = _pendingEvents.value
-            .mapTo(hashSetOf()) { it.groupId to it.acknowledgementKey }
-        val relevant = poll.events
-            .filter { it.senderId != candidate.deviceId }
-            .filter {
-                val eventInstanceId = it.serverInstanceId.normalizedInstanceId()
-                eventInstanceId == currentInstanceId
-            }
-            .distinctBy { it.groupId to it.acknowledgementKey }
-            .sortedBy { it.eventId }
-        val added = relevant.filter { (it.groupId to it.acknowledgementKey) !in existing }
-        val updated = (_pendingEvents.value + added)
-            .distinctBy { it.groupId to it.acknowledgementKey }
-            .sortedBy { it.eventId }
-        if (added.isNotEmpty()) {
-            persistPendingEvents(updated)
-            _pendingEvents.value = updated
-        }
-        val pendingKeys = updated.mapTo(hashSetOf()) { it.groupId to it.acknowledgementKey }
-        return relevant.filter { (it.groupId to it.acknowledgementKey) in pendingKeys }
-    }
-
-    fun acknowledgeThrough(candidate: RelayConfig, poll: RelayPollResult) {
-        synchronized(lock) {
-            if (!sameRelayConnection(candidate, config.value)) return@synchronized
-            if (!poll.cursorValid) return@synchronized
-            val responseInstanceId = poll.serverInstanceId.normalizedInstanceId()
-            if (responseInstanceId != _currentServerInstanceId.value) {
-                return@synchronized
-            }
-            if (poll.cursor < _cursor.value) return@synchronized
-            val responseCursorToken = poll.cursorToken.normalizedCursorToken()
-            if (poll.cursor == _cursor.value && responseCursorToken == _cursorToken.value) {
-                return@synchronized
-            }
-            val editor = preferences.edit()
-                .putLong(KEY_CURSOR, poll.cursor)
-                .putBoolean(KEY_CURSOR_INITIALIZED, true)
-            if (responseCursorToken != null) {
-                editor.putString(KEY_CURSOR_TOKEN, responseCursorToken)
-            } else {
-                editor.remove(KEY_CURSOR_TOKEN)
-            }
-            check(editor.commit()) { "无法保存报警游标和令牌" }
-            _cursor.value = poll.cursor
-            _cursorToken.value = responseCursorToken
-        }
-    }
-
-    fun acknowledgeLocally(acknowledgementKey: String) = synchronized(lock) {
-        val updated = _pendingEvents.value.filterNot { event ->
-            event.matchesAcknowledgementKey(acknowledgementKey)
-        }
-        if (updated.size == _pendingEvents.value.size) return@synchronized
-        persistPendingEvents(updated)
-        _pendingEvents.value = updated
-    }
-
-    fun acknowledgeAllLocally() = synchronized(lock) {
-        if (_pendingEvents.value.isEmpty()) return@synchronized
-        persistPendingEvents(emptyList())
-        _pendingEvents.value = emptyList()
-    }
-
-    suspend fun refreshMonitors(): Result<RemoteMonitorsResult> = withContext(Dispatchers.IO) {
-        val current = config.value
-        relayResult(current) {
-            validateRelayConfig(current, requireEnabled = false)
-            api.monitors(current).also {
-                recordRemoteMonitorsIfCurrent(current, it)
-                recordOnlineIfCurrent(current)
-            }
-        }
-    }
-
-    suspend fun listRemoteMonitorConfigs(): Result<RemoteMonitorConfigsResult> =
-        withContext(Dispatchers.IO) {
-            adminResult {
-                val current = config.value
-                validateAdminConfig(current)
-                api.listMonitorConfigs(current).also {
-                    if (sameAdminIdentity(current, config.value)) {
-                        _remoteMonitorConfigs.value = it.monitors
-                    }
-                }
-            }
-        }
-
-    suspend fun createRemoteMonitor(
-        request: RemoteMonitorUpsertRequest
-    ): Result<RemoteMonitorMutationResult> = withContext(Dispatchers.IO) {
-        adminResult {
-            validateUpsert(request)
-            val current = config.value
-            validateAdminConfig(current)
-            api.createMonitor(current, request.copy(revision = null)).also { result ->
-                upsertRemoteMonitorIfCurrent(current, result.monitor)
-            }
-        }
-    }
-
-    suspend fun updateRemoteMonitor(
-        monitorId: String,
-        request: RemoteMonitorUpsertRequest
-    ): Result<RemoteMonitorMutationResult> = withContext(Dispatchers.IO) {
-        adminResult {
-            validateUpsert(request)
-            val id = monitorId.trim()
-            require(RelayConfig.isValidIdentifier(id)) {
-                "监控 ID 必须为 1 到 64 位字母、数字、点、下划线或短横线"
-            }
-            val current = config.value
-            validateAdminConfig(current)
-            api.updateMonitor(current, id, request).also { result ->
-                upsertRemoteMonitorIfCurrent(current, result.monitor)
-            }
-        }
-    }
-
-    suspend fun deleteRemoteMonitor(
-        monitorId: String
-    ): Result<RemoteMonitorDeleteResult> = withContext(Dispatchers.IO) {
-        adminResult {
-            val id = monitorId.trim()
-            require(RelayConfig.isValidIdentifier(id)) {
-                "监控 ID 必须为 1 到 64 位字母、数字、点、下划线或短横线"
-            }
-            val current = config.value
-            validateAdminConfig(current)
-            api.deleteMonitor(current, id).also {
-                if (sameAdminIdentity(current, config.value)) {
-                    _remoteMonitorConfigs.value =
-                        _remoteMonitorConfigs.value.filterNot { monitor -> monitor.id == id }
-                }
-            }
-        }
-    }
-
-    suspend fun copyRemoteMonitor(
-        monitorId: String
-    ): Result<RemoteMonitorMutationResult> = withContext(Dispatchers.IO) {
-        adminResult {
-            val id = monitorId.trim()
-            require(RelayConfig.isValidIdentifier(id)) { "监控 ID 无效" }
-            val current = config.value
-            validateAdminConfig(current)
-            api.copyMonitor(current, id).also { result ->
-                if (sameAdminIdentity(current, config.value)) {
-                    val updated = _remoteMonitorConfigs.value.toMutableList()
-                    val sourceIndex = updated.indexOfFirst { monitor -> monitor.id == id }
-                    val insertAt = if (sourceIndex >= 0) sourceIndex + 1 else updated.size
-                    updated.add(insertAt, result.monitor)
-                    _remoteMonitorConfigs.value = updated
-                }
-            }
-        }
-    }
-
-    suspend fun reorderRemoteMonitors(
-        expectedMonitorIds: List<String>,
-        monitorIds: List<String>
-    ): Result<RemoteMonitorConfigsResult> = withContext(Dispatchers.IO) {
-        adminResult {
-            require(expectedMonitorIds.size == expectedMonitorIds.distinct().size) {
-                "原监控顺序包含重复 ID"
-            }
-            require(monitorIds.size == monitorIds.distinct().size) { "新监控顺序包含重复 ID" }
-            require(expectedMonitorIds.toSet() == monitorIds.toSet()) { "排序前后监控 ID 不一致" }
-            val current = config.value
-            validateAdminConfig(current)
-            api.reorderMonitors(current, expectedMonitorIds, monitorIds).also { result ->
-                if (sameAdminIdentity(current, config.value)) {
-                    _remoteMonitorConfigs.value = result.monitors
-                }
-            }
-        }
-    }
-
-    suspend fun refreshRemoteMonitorValues(): Result<RemoteMonitorRefreshResult> =
-        withContext(Dispatchers.IO) {
-            adminResult {
-                val current = config.value
-                validateAdminConfig(current)
-                validateRelayConfig(current, requireEnabled = false)
-                refreshRemoteMonitorValuesAndPublish(api, current) { latest ->
-                    recordRemoteMonitorsIfCurrent(
-                        candidate = current,
-                        result = latest,
-                        requireAdminIdentity = true
-                    )
-                }.also {
-                    recordOnlineIfCurrent(current)
-                }
-            }
-        }
-
-    suspend fun testRemoteMonitor(
-        monitorId: String
-    ): Result<RemoteMonitorTestResult> = withContext(Dispatchers.IO) {
-        adminResult {
-            val id = monitorId.trim()
-            require(RelayConfig.isValidIdentifier(id)) {
-                "请先保存有效的监控 ID 再测试"
-            }
-            val current = config.value
-            validateAdminConfig(current)
-            api.testMonitor(current, id)
-        }
-    }
-
-    private inline fun <T> relayResult(
-        candidate: RelayConfig,
-        block: () -> T
-    ): Result<T> = try {
-        Result.success(block())
-    } catch (cancelled: CancellationException) {
-        throw cancelled
+        document
     } catch (error: Exception) {
-        recordOfflineIfCurrent(candidate, error)
-        Result.failure(error)
+        loadError = "无法读取本机加密数据，请保留应用数据并检查设备密钥"
+        JSONObject()
     }
-
-    private inline fun <T> adminResult(block: () -> T): Result<T> = try {
-        Result.success(block())
-    } catch (cancelled: CancellationException) {
-        throw cancelled
-    } catch (error: Exception) {
-        Result.failure(error)
-    }
-
-    private fun recordOnlineIfCurrent(
-        candidate: RelayConfig,
-        onlineClients: Int? = null,
-        totalClients: Int? = null
-    ) {
-        val now = System.currentTimeMillis()
-        updateStatusIfCurrent(candidate) { previous ->
-            previous.copy(
-                state = RelayConnectionState.ONLINE,
-                lastCheckedAt = now,
-                lastOnlineAt = now,
-                lastError = "",
-                onlineClients = onlineClients ?: previous.onlineClients,
-                totalClients = totalClients ?: previous.totalClients
-            )
-        }
-    }
-
-    private fun recordOfflineIfCurrent(candidate: RelayConfig, error: Exception) {
-        val now = System.currentTimeMillis()
-        updateStatusIfCurrent(candidate) { previous ->
-            previous.copy(
-                state = if (config.value.enabled) {
-                    RelayConnectionState.OFFLINE
-                } else {
-                    RelayConnectionState.DISABLED
-                },
-                lastCheckedAt = now,
-                lastError = error.message ?: error.javaClass.simpleName
-            )
-        }
-    }
-
-    private fun updateStatusIfCurrent(
-        candidate: RelayConfig,
-        transform: (RelayStatus) -> RelayStatus
-    ) = synchronized(lock) {
-        if (!sameRelayConnection(candidate, config.value)) return@synchronized
-        val updated = transform(_status.value)
-        _status.value = updated
-        persistStatus(updated)
-    }
-
-    private fun reconcileServerStateIfCurrent(
-        candidate: RelayConfig,
-        serverInstanceId: String?,
-        serverCursor: Long,
-        serverCursorToken: String?,
-        cursorValid: Boolean,
-        initializeIfNeeded: Boolean,
-        checkCursorRegression: Boolean
-    ): Boolean = synchronized(lock) {
-        if (!sameRelayConnection(candidate, config.value)) {
-            throw CancellationException("通信配置已变更")
-        }
-
-        val incomingInstanceId = serverInstanceId.normalizedInstanceId()
-        val incomingCursorToken = serverCursorToken.normalizedCursorToken()
-        val storedInstanceId = _currentServerInstanceId.value
-        val initialized = preferences.getBoolean(KEY_CURSOR_INITIALIZED, false)
-        val decision = decideRelayServerState(
-            storedInstanceId = storedInstanceId,
-            incomingInstanceId = incomingInstanceId,
-            cursor = _cursor.value,
-            serverCursor = serverCursor,
-            cursorInitialized = initialized,
-            cursorTokenPresent = _cursorToken.value != null,
-            serverCursorTokenPresent = incomingCursorToken != null,
-            cursorValid = cursorValid,
-            initializeIfNeeded = initializeIfNeeded,
-            checkCursorRegression = checkCursorRegression
-        )
-        if (!decision.changed) return@synchronized false
-
-        val initializingCursor = !initialized && initializeIfNeeded && !decision.resetCursor
-        val nextCursorToken = when {
-            decision.resetCursor -> null
-            initializingCursor -> incomingCursorToken
-            else -> _cursorToken.value
-        }
-        val editor = preferences.edit()
-            .putLong(KEY_CURSOR, decision.cursor)
-            .putBoolean(KEY_CURSOR_INITIALIZED, decision.cursorInitialized)
-        if (nextCursorToken != null) {
-            editor.putString(KEY_CURSOR_TOKEN, nextCursorToken)
-        } else {
-            editor.remove(KEY_CURSOR_TOKEN)
-        }
-        if (decision.serverInstanceId != null) {
-            editor.putString(KEY_SERVER_INSTANCE_ID, decision.serverInstanceId)
-        } else {
-            editor.remove(KEY_SERVER_INSTANCE_ID)
-        }
-        check(editor.commit()) { "无法保存服务端实例和报警游标" }
-        _cursor.value = decision.cursor
-        _cursorToken.value = nextCursorToken
-        _currentServerInstanceId.value = decision.serverInstanceId
-        decision.resetCursor
-    }
-
-    private fun recordRemoteMonitorsIfCurrent(
-        candidate: RelayConfig,
-        result: RemoteMonitorsResult,
-        requireAdminIdentity: Boolean = false
-    ): RemoteMonitorSnapshotPublication = synchronized(lock) {
-        remoteMonitorSnapshotGate.publish(
-            serverTime = result.serverTime,
-            relayIdentityMatches = sameIdentity(candidate, config.value),
-            adminIdentityMatches = sameAdminIdentity(candidate, config.value),
-            requireAdminIdentity = requireAdminIdentity
-        ) {
-            _monitorStatuses.value = result.monitors
-            _monitorConfigStatus.value = result.config
-        }
-    }
-
-    private fun upsertRemoteMonitorIfCurrent(candidate: RelayConfig, monitor: RemoteMonitorConfig) {
-        if (!sameAdminIdentity(candidate, config.value)) return
-        val updated = _remoteMonitorConfigs.value.toMutableList()
-        val index = updated.indexOfFirst { it.id == monitor.id }
-        if (index >= 0) updated[index] = monitor else updated.add(monitor)
-        _remoteMonitorConfigs.value = updated.toList()
-    }
-
-    private fun validateRelayConfig(value: RelayConfig, requireEnabled: Boolean = true) {
-        if (requireEnabled) require(value.enabled) { "通信功能未启用" }
-        validateServerUrl(value.serverUrl)
-        require(value.sharedToken.isNotBlank()) { "共享密钥不能为空" }
-        require(RelayConfig.isValidIdentifier(value.deviceId)) {
-            "客户端 ID 必须为 1 到 64 位字母、数字、点、下划线或短横线"
-        }
-    }
-
-    private fun validateAdminConfig(value: RelayConfig) {
-        validateServerUrl(value.serverUrl)
-        require(value.adminToken.isNotBlank()) { "管理员密钥不能为空" }
-    }
-
-    private fun validateUpsert(value: RemoteMonitorUpsertRequest) {
-        require(value.name.isNotBlank() && value.name.length <= RelayConfig.MAX_NAME_LENGTH) {
-            "监控名称必须为 1 到 ${RelayConfig.MAX_NAME_LENGTH} 个字符"
-        }
-        require(value.url.length in 1..RelayConfig.MAX_URL_LENGTH) {
-            "监控地址不能超过 ${RelayConfig.MAX_URL_LENGTH} 个字符"
-        }
-        val uri = runCatching { URI(value.url.trim()) }.getOrNull()
-        require(uri != null && (uri.scheme == "http" || uri.scheme == "https") && !uri.host.isNullOrBlank()) {
-            "监控地址必须是有效的 http:// 或 https:// 地址"
-        }
-        require(value.method.uppercase() in setOf("GET", "POST")) { "请求方法仅支持 GET 或 POST" }
-        require(value.jsonPath.isNotBlank() && value.jsonPath.length <= MAX_JSON_PATH_LENGTH) {
-            "JSON 字段路径必须为 1 到 $MAX_JSON_PATH_LENGTH 个字符"
-        }
-        require(value.operator in SUPPORTED_OPERATORS) { "比较符仅支持 <、<=、>、>=、= 或 ==" }
-        require(value.threshold.isFinite() && value.multiplier.isFinite() && value.offset.isFinite()) {
-            "阈值、倍率和偏移量必须是有效数值"
-        }
-        require(value.pollIntervalSeconds >= 5) { "检测间隔不能少于 5 秒" }
-        require(value.timeoutSeconds in 1..60) { "超时时间必须为 1 到 60 秒" }
-        require(value.errorThreshold in 1..100) { "连续错误阈值必须为 1 到 100" }
-        require(value.repeatAlertSeconds == 0L || value.repeatAlertSeconds >= 15) {
-            "重复报警间隔必须为 0，或不少于 15 秒"
-        }
-        value.headersJson?.takeIf { it.isNotBlank() }?.let { JSONObject(it) }
-    }
-
-    private fun validateServerUrl(value: String) {
-        require(value.length in 1..RelayConfig.MAX_URL_LENGTH) {
-            "服务端地址不能超过 ${RelayConfig.MAX_URL_LENGTH} 个字符"
-        }
-        val uri = runCatching { URI(value.trim()) }.getOrNull()
-        require(
-            uri != null && (uri.scheme == "http" || uri.scheme == "https") &&
-                !uri.host.isNullOrBlank()
-        ) { "服务端地址必须是有效的 http:// 或 https:// 地址" }
-        require(uri.rawQuery == null && uri.rawFragment == null) {
-            "服务端地址不能包含查询参数或片段"
-        }
-    }
-
-    private fun sameIdentity(first: RelayConfig, second: RelayConfig): Boolean =
-        first.serverUrl == second.serverUrl &&
-            first.deviceId == second.deviceId &&
-            first.sharedToken == second.sharedToken
-
-    private fun sameRelayConnection(first: RelayConfig, second: RelayConfig): Boolean =
-        sameIdentity(first, second) && first.enabled == second.enabled
-
-    private fun sameAdminIdentity(first: RelayConfig, second: RelayConfig): Boolean =
-        first.serverUrl == second.serverUrl &&
-            first.adminToken == second.adminToken
 
     private fun loadConfig(): RelayConfig {
-        if (!preferences.contains(KEY_CONFIG)) return RelayConfig.freshInstall()
-        return runCatching {
-            val json = JSONObject(preferences.getString(KEY_CONFIG, "{}") ?: "{}")
-            val encryptedSharedToken = json.optString("encryptedSharedToken")
-                .ifBlank { json.optString("encryptedToken") }
-            val encryptedAdminToken = json.optString("encryptedAdminToken")
-            RelayConfig(
-                serverUrl = RelayConfig.migrateServerUrl(json.optString("serverUrl")),
-                sharedToken = decryptSecret(encryptedSharedToken).ifBlank {
-                    json.optString("sharedToken").ifBlank { json.optString("authToken") }
-                },
-                adminToken = decryptSecret(encryptedAdminToken).ifBlank {
-                    json.optString("adminToken")
-                },
-                deviceId = json.optString("deviceId").ifBlank { UUID.randomUUID().toString() },
-                enabled = json.optBoolean("enabled", false),
-                vibrateEnabled = json.optBoolean("vibrateEnabled", true),
-                soundEnabled = json.optBoolean("soundEnabled", true),
-                alarmVolumePercent = json.optInt("alarmVolumePercent", 100),
-                ringtoneUri = json.optString("ringtoneUri")
-            ).normalized()
-        }.getOrElse { RelayConfig() }
+        val j = runCatching { JSONObject(preferences.getString("config", "{}") ?: "{}") }.getOrDefault(JSONObject())
+        return RelayConfig(enabled = j.optBoolean("enabled"), soundEnabled = j.optBoolean("soundEnabled", true),
+            vibrateEnabled = j.optBoolean("vibrateEnabled", true), alarmVolumePercent = j.optInt("alarmVolumePercent", 100),
+            ringtoneUri = j.optString("ringtoneUri")).normalized()
     }
 
-    private fun storedConfigUsesRetiredServer(): Boolean {
-        val storedUrl = runCatching {
-            JSONObject(preferences.getString(KEY_CONFIG, "{}") ?: "{}").optString("serverUrl")
-        }.getOrDefault("")
-        return RelayConfig.migrateServerUrl(storedUrl) != storedUrl
+    fun saveConfig(value: RelayConfig) = synchronized(lock) {
+        val normalized = value.normalized()
+        val j = JSONObject().put("enabled", normalized.enabled).put("soundEnabled", normalized.soundEnabled)
+            .put("vibrateEnabled", normalized.vibrateEnabled).put("alarmVolumePercent", normalized.alarmVolumePercent)
+            .put("ringtoneUri", normalized.ringtoneUri)
+        check(preferences.edit().putString("config", j.toString()).commit()) { "无法保存本机设置或参数无效" }
+        _config.value = normalized
+        configGeneration++
+        _status.value = RelayStatus(if (normalized.enabled) RelayConnectionState.CHECKING else RelayConnectionState.DISABLED)
     }
 
-    private fun configJson(value: RelayConfig): JSONObject = JSONObject().apply {
-        put("serverUrl", value.serverUrl)
-        put("encryptedSharedToken", encryptSecret(value.sharedToken))
-        put("encryptedAdminToken", encryptSecret(value.adminToken))
-        put("deviceId", value.deviceId)
-        put("enabled", value.enabled)
-        put("vibrateEnabled", value.vibrateEnabled)
-        put("soundEnabled", value.soundEnabled)
-        put("alarmVolumePercent", value.alarmVolumePercent)
-        put("ringtoneUri", value.ringtoneUri)
-    }
+    fun setEnabled(enabled: Boolean) = saveConfig(config.value.copy(enabled = enabled))
 
-    private fun persistConfig(value: RelayConfig) {
-        check(preferences.edit().putString(KEY_CONFIG, configJson(value).toString()).commit()) {
-            "无法保存通信配置"
-        }
-    }
-
-    private fun persistConfigAndResetDeliveryLocked(value: RelayConfig) {
-        check(
-            preferences.edit()
-                .putString(KEY_CONFIG, configJson(value).toString())
-                .putString(KEY_PENDING_EVENTS, "[]")
-                .putLong(KEY_CURSOR, 0L)
-                .putBoolean(KEY_CURSOR_INITIALIZED, false)
-                .remove(KEY_CURSOR_TOKEN)
-                .remove(KEY_SERVER_INSTANCE_ID)
-                .commit()
-        ) { "无法保存通信配置并重置报警状态" }
-        _pendingEvents.value = emptyList()
-        _cursor.value = 0L
-        _cursorToken.value = null
-        _currentServerInstanceId.value = null
-    }
-
-    private fun loadStatus(): RelayStatus = runCatching {
-        val json = JSONObject(preferences.getString(KEY_STATUS, "{}") ?: "{}")
-        RelayStatus(
-            state = runCatching {
-                RelayConnectionState.valueOf(json.optString("state"))
-            }.getOrDefault(RelayConnectionState.DISABLED),
-            lastCheckedAt = json.optLong("lastCheckedAt"),
-            lastOnlineAt = json.optLong("lastOnlineAt"),
-            lastError = json.optString("lastError"),
-            onlineClients = json.optInt("onlineClients"),
-            totalClients = json.optInt("totalClients")
-        )
-    }.getOrDefault(RelayStatus())
-
-    private fun persistStatus(value: RelayStatus) {
-        val json = JSONObject().apply {
-            put("state", value.state.name)
-            put("lastCheckedAt", value.lastCheckedAt)
-            put("lastOnlineAt", value.lastOnlineAt)
-            put("lastError", value.lastError)
-            put("onlineClients", value.onlineClients)
-            put("totalClients", value.totalClients)
-        }
-        preferences.edit().putString(KEY_STATUS, json.toString()).apply()
-    }
-
-    private fun loadPendingEvents(): List<RelayAlarmEvent> = runCatching {
-        val array = JSONArray(preferences.getString(KEY_PENDING_EVENTS, "[]") ?: "[]")
-        buildList {
-            for (index in 0 until array.length()) {
-                add(array.getJSONObject(index).toRelayAlarmEvent())
+    suspend fun importMonitorConfig(uri: Uri): Result<Int> = operation {
+        val text = appContext.contentResolver.openInputStream(uri)?.use(MonitorConfigImport::read)
+            ?: error("无法打开所选配置文件")
+        val imported = MonitorConfigImport.parse(text)
+        // Wait for the current batch, then replace all data in one durable write. No old
+        // queued checks can publish after the replacement or sound an obsolete alarm.
+        checkMutex.withLock {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                synchronized(lock) {
+                    persist(imported, emptyMap(), emptyList())
+                    configGeneration++
+                }
+                com.creditinform.app.monitoring.AlarmController.dismissAll(appContext)
             }
         }
-    }.getOrDefault(emptyList())
+        imported.size
+    }
 
-    private fun persistPendingEvents(events: List<RelayAlarmEvent>) {
-        val array = JSONArray().apply { events.forEach { put(it.toJson()) } }
-        check(preferences.edit().putString(KEY_PENDING_EVENTS, array.toString()).commit()) {
-            "无法保存待处理报警"
+    private fun persist(monitors: List<RemoteMonitorConfig> = _remoteMonitorConfigs.value,
+                        nextStates: Map<String, LocalMonitorState> = states,
+                        pending: List<RelayAlarmEvent> = _pendingEvents.value) {
+        check(loadError.isEmpty()) { loadError }
+        val document = JSONObject().put("monitors", JSONArray().apply { monitors.forEach { put(it.toLocalJson()) } })
+            .put("states", JSONObject().apply { nextStates.forEach { (id, state) -> put(id, state.toJson()) } })
+            .put("pending", JSONArray().apply { pending.forEach { put(it.toJson()) } })
+        check(preferences.edit().putString("local_document_v1", encryptSecret(document.toString())).commit()) { "无法保存本机监控数据" }
+        states = nextStates
+        _remoteMonitorConfigs.value = monitors
+        _pendingEvents.value = pending
+        _monitorStatuses.value = monitors.map { (states[it.id] ?: LocalMonitorState()).status(it) }
+    }
+
+    fun acknowledgeLocally(key: String) = synchronized(lock) {
+        if (_pendingEvents.value.any { it.matchesAcknowledgementKey(key) }) {
+            persist(pending = _pendingEvents.value.filterNot { it.matchesAcknowledgementKey(key) })
         }
     }
+    fun acknowledgeAllLocally() = synchronized(lock) {
+        if (_pendingEvents.value.isNotEmpty()) persist(pending = emptyList())
+    }
+
+    suspend fun testConnection(): Result<Unit> = operation { check(loadError.isEmpty()) { loadError } }
+    suspend fun refreshMonitors(): Result<RemoteMonitorsResult> = operation {
+        RemoteMonitorsResult(System.currentTimeMillis(), _monitorConfigStatus.value, _monitorStatuses.value)
+    }
+    suspend fun listRemoteMonitorConfigs(): Result<RemoteMonitorConfigsResult> = operation {
+        check(loadError.isEmpty()) { loadError }; configsResult()
+    }
+    private fun configsResult() = RemoteMonitorConfigsResult(System.currentTimeMillis(), "", _remoteMonitorConfigs.value)
+
+    suspend fun createRemoteMonitor(request: RemoteMonitorUpsertRequest) = saveMonitor(null, request)
+    suspend fun updateRemoteMonitor(id: String, request: RemoteMonitorUpsertRequest) = saveMonitor(id, request)
+    private suspend fun saveMonitor(id: String?, request: RemoteMonitorUpsertRequest): Result<RemoteMonitorMutationResult> = operation {
+        synchronized(lock) {
+            validateMonitorRequest(request)
+            val old = id?.let { key -> _remoteMonitorConfigs.value.firstOrNull { it.id == key } ?: error("监控不存在") }
+            if (old != null && request.revision != null && old.revision != request.revision) throw RelayApiException(409, "配置已更新，请重新打开编辑")
+            val body = if (request.bodySpecified) request.body else old?.body
+            val monitor = RemoteMonitorConfig("local", id ?: UUID.randomUUID().toString(), (old?.revision ?: 0) + 1,
+                System.currentTimeMillis(), request.name, request.url, request.method, request.headersJson ?: old?.headersJson,
+                body, headersConfigured = !request.headersJson.isNullOrBlank(), bodyConfigured = body != null,
+                jsonPath = request.jsonPath, operator = request.operator, threshold = request.threshold,
+                multiplier = request.multiplier, offset = request.offset, pollIntervalSeconds = request.pollIntervalSeconds,
+                timeoutSeconds = request.timeoutSeconds, errorThreshold = request.errorThreshold, repeatAlertSeconds = request.repeatAlertSeconds,
+                enabled = request.enabled, provider = request.provider, gatewayAccessKey = request.gatewayAccessKey,
+                gatewaySecretKey = request.gatewaySecretKey)
+            val monitors = if (old == null) _remoteMonitorConfigs.value + monitor else _remoteMonitorConfigs.value.map { if (it.id == id) monitor else it }
+            persist(monitors, states - monitor.id)
+            RemoteMonitorMutationResult(System.currentTimeMillis(), "", monitor)
+        }
+    }
+
+    suspend fun deleteRemoteMonitor(id: String): Result<RemoteMonitorDeleteResult> = operation {
+        synchronized(lock) {
+            persist(_remoteMonitorConfigs.value.filterNot { it.id == id }, states - id)
+            RemoteMonitorDeleteResult(System.currentTimeMillis())
+        }
+    }
+    suspend fun copyRemoteMonitor(id: String): Result<RemoteMonitorMutationResult> = operation {
+        synchronized(lock) {
+            val list = _remoteMonitorConfigs.value.toMutableList()
+            val index = list.indexOfFirst { it.id == id }
+            require(index >= 0) { "监控不存在" }
+            val copy = list[index].copy(id = UUID.randomUUID().toString(), name = list[index].name.take(120) + " 副本", revision = 1)
+            list.add(index + 1, copy)
+            persist(list)
+            RemoteMonitorMutationResult(System.currentTimeMillis(), "", copy)
+        }
+    }
+    suspend fun reorderRemoteMonitors(expectedMonitorIds: List<String>, monitorIds: List<String>): Result<RemoteMonitorConfigsResult> = operation {
+        synchronized(lock) {
+            val list = _remoteMonitorConfigs.value
+            require(expectedMonitorIds == list.map { it.id } && monitorIds.size == list.size && monitorIds.toSet() == expectedMonitorIds.toSet()) { "监控列表已变更或检测参数无效" }
+            persist(monitorIds.map { id -> list.first { it.id == id } })
+            configsResult()
+        }
+    }
+
+    suspend fun sendAlarm(message: String): Result<Unit> = operation {
+        synchronized(lock) {
+            require(config.value.enabled) { "请先启用本机监控" }
+            persist(pending = _pendingEvents.value + event(null, RelayAlertType.MANUAL, message.take(500)))
+        }
+    }
+    private fun event(monitor: RemoteMonitorConfig?, type: RelayAlertType, message: String) = RelayAlarmEvent(
+        System.currentTimeMillis(), type, "local", "local", "本机", message, System.currentTimeMillis(),
+        monitor?.id, monitor?.name, UUID.randomUUID().toString())
+
+    suspend fun testRemoteMonitor(id: String): Result<RemoteMonitorTestResult> = operation {
+        checkMutex.withLock {
+            val monitor = _remoteMonitorConfigs.value.firstOrNull { it.id == id } ?: error("监控不存在")
+            checkOne(monitor, false).getOrThrow()
+        }
+    }
+    suspend fun refreshRemoteMonitorValues(): Result<RemoteMonitorRefreshResult> = operation {
+        checkMutex.withLock { checkAll(false) }
+    }
+    suspend fun checkDueMonitors(): Result<RemoteMonitorRefreshResult> = operation {
+        checkMutex.withLock { checkAll(true) }
+    }
+    private suspend fun checkAll(dueOnly: Boolean): RemoteMonitorRefreshResult = coroutineScope {
+        check(loadError.isEmpty()) { loadError }
+        val now = System.currentTimeMillis()
+        val monitors = synchronized(lock) {
+            _remoteMonitorConfigs.value.filter { it.enabled && (!dueOnly || (config.value.enabled && (states[it.id]?.nextAt ?: 0) <= now)) }
+        }
+        val semaphore = Semaphore(4)
+        val results = monitors.map { monitor -> async {
+            semaphore.withPermit {
+                val result = checkOne(monitor, true)
+                val value = result.getOrNull()
+                RemoteMonitorRefreshItemResult(monitor.id, monitor.name, result.isSuccess,
+                    value?.let { RemoteMonitorRefreshCheckResult(it.httpCode, it.rawValue, it.value, it.breached) },
+                    result.exceptionOrNull()?.let { RemoteMonitorRefreshError("CHECK_FAILED", it.message.orEmpty(), (it as? RelayApiException)?.httpCode) })
+            }
+        } }.awaitAll()
+        _status.value = RelayStatus(if (config.value.enabled) RelayConnectionState.ONLINE else RelayConnectionState.DISABLED,
+            lastCheckedAt = System.currentTimeMillis())
+        RemoteMonitorRefreshResult(results.all { it.ok }, System.currentTimeMillis(), results.size, results.count { it.ok }, results.count { !it.ok }, results)
+    }
+    private fun checkOne(monitor: RemoteMonitorConfig, allowAlarm: Boolean): Result<RemoteMonitorTestResult> {
+        val generation = synchronized(lock) { configGeneration }
+        val result = runCatching { client.check(monitor) }
+        synchronized(lock) {
+            // Editing, deleting or disabling during a request invalidates its result.
+            if (generation != configGeneration || _remoteMonitorConfigs.value.firstOrNull { it.id == monitor.id } != monitor) return result
+            val previous = states[monitor.id] ?: LocalMonitorState()
+            val (next, alarm) = previous.checked(monitor, result, System.currentTimeMillis(), allowAlarm && config.value.enabled && monitor.enabled)
+            val pending = if (alarm == null || _pendingEvents.value.any { it.monitorId == monitor.id && it.type == alarm }) _pendingEvents.value
+                else _pendingEvents.value + event(monitor, alarm, if (alarm == RelayAlertType.MONITOR_BREACH) "当前值 ${next.value}，报警条件 ${monitor.operator} ${monitor.threshold}" else "连续 ${next.errors} 次检测失败：${next.error}")
+            persist(nextStates = states + (monitor.id to next), pending = pending)
+        }
+        return result
+    }
+
+    private suspend fun <T> operation(block: suspend () -> T): Result<T> = withContext(Dispatchers.IO) {
+        try { Result.success(block()) } catch (cancelled: CancellationException) { throw cancelled }
+        catch (error: Exception) { Result.failure(error) }
+    }
+    private fun <T> readArray(array: JSONArray?, parse: (JSONObject) -> T): List<T> =
+        if (array == null) emptyList() else (0 until array.length()).map { parse(array.getJSONObject(it)) }
 
     private fun RelayAlarmEvent.toJson() = JSONObject().apply {
         put("eventId", eventId)
@@ -831,7 +297,7 @@ class RelayRepository private constructor(context: Context) {
 
     private fun decryptSecret(value: String): String {
         if (value.isBlank()) return ""
-        return runCatching {
+        return run {
             val parts = value.split(':', limit = 2)
             require(parts.size == 2)
             val cipher = Cipher.getInstance(TRANSFORMATION).apply {
@@ -842,7 +308,7 @@ class RelayRepository private constructor(context: Context) {
                 )
             }
             cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)).toString(Charsets.UTF_8)
-        }.getOrDefault("")
+        }
     }
 
     private fun getOrCreateSecretKey(): SecretKey {
@@ -863,32 +329,13 @@ class RelayRepository private constructor(context: Context) {
         }
     }
 
-    private fun String?.normalizedInstanceId(): String? =
-        this?.trim()?.takeIf { it.isNotEmpty() }
-
-    private fun String?.normalizedCursorToken(): String? =
-        this?.takeIf { it.isNotBlank() }
 
     companion object {
-        private const val PREFS_NAME = "credit_inform_relay"
-        private const val KEY_CONFIG = "config"
-        private const val KEY_STATUS = "relay_status_v2"
-        private const val KEY_PENDING_EVENTS = "pending_events_v2"
-        private const val KEY_CURSOR = "event_cursor_v2"
-        private const val KEY_CURSOR_INITIALIZED = "event_cursor_initialized_v2"
-        private const val KEY_CURSOR_TOKEN = "event_cursor_token_v2"
-        private const val KEY_SERVER_INSTANCE_ID = "server_instance_id_v2"
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
-        private const val KEY_ALIAS = "credit_inform_relay_token"
+        private const val KEY_ALIAS = "credit_inform_local_monitor"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
         private const val GCM_TAG_BITS = 128
-        private const val MAX_MESSAGE_LENGTH = 500
-        private const val MAX_JSON_PATH_LENGTH = 512
-        private val SUPPORTED_OPERATORS = setOf("<", "<=", ">", ">=", "=", "==")
-
-        @Volatile
-        private var instance: RelayRepository? = null
-
+        @Volatile private var instance: RelayRepository? = null
         fun get(context: Context): RelayRepository = instance ?: synchronized(this) {
             instance ?: RelayRepository(context.applicationContext).also { instance = it }
         }

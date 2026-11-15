@@ -129,9 +129,15 @@ Compose 默认只绑定 `127.0.0.1:8047`，适合由同机反向代理提供 HTT
 nonce、时间戳和 IV，响应解密绑定本次请求 nonce；所有认证和 SK 的读取都在服务端完成。
 网页和 App 的新增/编辑监控界面都可选择“GateWay”。
 
-先在服务器上设置环境变量 `GATEWAY_SK=gwsk_...`。使用 Docker Compose 时，在
-`server/.env` 中增加这一行，然后执行 `docker compose up -d --build`，使新进程载入 SK。
-SK 从 GateWay 控制台的 API 凭证页取得；不要在 App、网页、请求头或请求体里填写 SK。
+网页编辑监控时，可以直接在 **Secret Key（SK）** 中填写与 AK 配套的密钥，点击保存或测试即可生效，
+不需要登录服务器或重启容器。SK 从 GateWay 控制台的 API 凭证页取得。
+密钥随该监控保存在服务端持久化配置中，文件权限为 `0600`；管理 API 和普通客户端均不会读回 SK，
+只会返回 `gatewaySecretKeyConfigured` 表示是否已保存。再次编辑时留空保留原值，填写新值可替换。
+已有手机端不需要更新即可使用网页保存的密钥，修改其他配置也不会清空 SK。
+
+仍支持环境变量方式：没有为监控保存 SK 时，读取 `gatewaySecretKeyEnv` 指定的服务器环境变量。
+使用 Docker Compose 时可在 `server/.env` 中设置 `GATEWAY_SK=gwsk_...` 后重建/重启容器。
+网页中的环境变量名位于“高级：使用服务器环境变量”中；不要把 SK 填到请求头或业务请求体中。
 
 在网页或 App 新建监控，选择 GateWay 后填写：
 
@@ -139,7 +145,8 @@ SK 从 GateWay 控制台的 API 凭证页取得；不要在 App、网页、请�
 | --- | --- |
 | 接口地址 | `https://op.privapi.cc/open/v1/balance/query` |
 | Access Key（AK） | API 凭证页中的 `gwak_` 加 24 位十六进制字符 |
-| 服务器 SK 环境变量名 | `GATEWAY_SK`（填写名称，不是密钥值） |
+| Secret Key（SK，网页） | 与 AK 配套的 `gwsk_...` 密钥，保存后不回显 |
+| SK 环境变量名（可选） | 未保存 SK 时使用，默认为 `GATEWAY_SK` |
 | 请求体 / 业务参数 | 留空或 `{}` |
 | JSON 字段路径 | `data.balance` |
 | 倍率 / 偏移量 | `1` / `0`，金额单位为美元 |
@@ -184,8 +191,10 @@ URL 必须使用 HTTPS 和完整接口路径，不带查询串、fragment、用�
 上游原始错误正文；连续失败仍按既有规则报警。限流返回 `Retry-After` 时，自动检测会相应延后
 （最长等待一天），不会立即自动重试。服务器时间应保持同步，凭证 IP 白名单应包含服务器出口 IP。
 
-多个凭证可分别使用不同的环境变量名。Compose 默认只注入 `GATEWAY_SK`；其他变量需自行在
-`compose.yaml` 的 `environment` 中映射。重置 SK 后更新服务器环境变量并重建/重启进程。
+管理 API 的创建/更新请求可携带只写字段 `gatewaySecretKey`。省略该字段或传空字符串保留已保存的密钥；
+已保存的密钥优先于环境变量，复制监控时一并复制，删除监控时一并删除。
+每个监控可以保存不同的 SK。使用环境变量方式时，Compose 默认只注入 `GATEWAY_SK`；其他变量需自行在
+`compose.yaml` 的 `environment` 中映射。
 
 ## 报警策略
 

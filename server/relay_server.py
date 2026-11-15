@@ -31,7 +31,7 @@ from typing import Any
 import gateway_client
 
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 MAX_REQUEST_BYTES = 16 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -659,6 +659,7 @@ class MonitorDefinition:
     provider: str = "http"
     gateway_access_key: str = ""
     gateway_secret_key_env: str = "GATEWAY_SK"
+    gateway_secret_key: str = field(default="", repr=False)
 
 
 @dataclass
@@ -836,6 +837,11 @@ def parse_runtime_config(document: Any) -> tuple[dict[str, str], list[MonitorDef
             raise ValueError(f"{prefix}.provider must be http or gateway")
         gateway_access_key = item.get("gatewayAccessKey", "")
         gateway_secret_key_env = item.get("gatewaySecretKeyEnv", "GATEWAY_SK")
+        gateway_secret_key = item.get("gatewaySecretKey", "")
+        if not isinstance(gateway_secret_key, str) or (
+            gateway_secret_key and not re.fullmatch(r"gwsk_[A-Za-z0-9_-]{43}", gateway_secret_key)
+        ):
+            raise ValueError(f"{prefix}.gatewaySecretKey format is invalid")
         if provider == "gateway":
             gateway_client.validate_url(url)
             if method != "POST":
@@ -871,6 +877,7 @@ def parse_runtime_config(document: Any) -> tuple[dict[str, str], list[MonitorDef
                 provider=provider,
                 gateway_access_key=gateway_access_key,
                 gateway_secret_key_env=gateway_secret_key_env,
+                gateway_secret_key=gateway_secret_key,
             )
         )
     return group_tokens, definitions
@@ -1114,6 +1121,8 @@ class MonitorManager:
             "provider",
             "gatewayAccessKey",
             "gatewaySecretKeyEnv",
+            "gatewaySecretKey",
+            "gatewaySecretKeyConfigured",
             "revision",
             "updatedAt",
         }
@@ -1156,6 +1165,14 @@ class MonitorManager:
                 result[field_name] = candidate[field_name]
         if "errorAlertAfter" in candidate:
             result["errorThreshold"] = candidate["errorAlertAfter"]
+        # Write-only credential: omitted/blank values preserve the stored key,
+        # including updates from older clients that only understand env names.
+        if "gatewaySecretKey" in candidate:
+            secret_key = candidate["gatewaySecretKey"]
+            if not isinstance(secret_key, str):
+                raise ValueError("gatewaySecretKey must be a string")
+            if secret_key.strip():
+                result["gatewaySecretKey"] = secret_key.strip()
         if "alertRepeatSeconds" in candidate:
             result["repeatAlertSeconds"] = candidate["alertRepeatSeconds"]
 
@@ -1212,6 +1229,7 @@ class MonitorManager:
             "provider": item.get("provider", "http"),
             "gatewayAccessKey": item.get("gatewayAccessKey", ""),
             "gatewaySecretKeyEnv": item.get("gatewaySecretKeyEnv", "GATEWAY_SK"),
+            "gatewaySecretKeyConfigured": bool(item.get("gatewaySecretKey")),
             "headersJson": json.dumps(
                 headers,
                 ensure_ascii=False,
@@ -1694,9 +1712,9 @@ class MonitorManager:
             self._release_in_flight(key)
 
     def _fetch_gateway_value(self, definition: MonitorDefinition) -> tuple[int, Decimal, Decimal]:
-        secret_key = os.environ.get(definition.gateway_secret_key_env, "").strip()
+        secret_key = definition.gateway_secret_key or os.environ.get(definition.gateway_secret_key_env, "").strip()
         if not secret_key:
-            raise MonitorFetchError("GateWay SK environment variable is not configured on the server")
+            raise MonitorFetchError("GateWay SK 未配置，请在网页编辑监控时填写 Secret Key（SK）并保存")
         try:
             http_code, document = gateway_client.call(
                 definition.url, definition.gateway_access_key, secret_key,

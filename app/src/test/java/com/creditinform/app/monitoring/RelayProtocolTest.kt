@@ -10,28 +10,6 @@ import org.junit.Test
 
 class RelayProtocolTest {
     @Test
-    fun `relay config normalizes server settings and alarm safety values`() {
-        val config = RelayConfig(
-            serverUrl = " https://alarm.example.com/ ",
-            groupId = " night-ops ",
-            sharedToken = " secret ",
-            adminToken = " admin-secret ",
-            deviceId = " owner-phone ",
-            deviceName = " owner ",
-            alarmVolumePercent = 0
-        ).normalized()
-
-        assertEquals("https://alarm.example.com", config.serverUrl)
-        assertEquals(RelayConfig.INTERNAL_GROUP_ID, config.groupId)
-        assertEquals("secret", config.sharedToken)
-        assertEquals("admin-secret", config.adminToken)
-        assertEquals("owner-phone", config.deviceId)
-        assertEquals(RelayConfig.INTERNAL_DEVICE_NAME, config.deviceName)
-        assertEquals(1, config.alarmVolumePercent)
-        assertTrue(config.isComplete)
-    }
-
-    @Test
     fun `unknown relay event types remain forward compatible`() {
         assertEquals(RelayAlertType.MANUAL, RelayAlertType.fromWire("manual"))
         assertEquals(RelayAlertType.MONITOR_BREACH, RelayAlertType.fromWire("monitor_breach"))

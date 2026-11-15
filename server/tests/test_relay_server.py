@@ -129,6 +129,39 @@ class RelayServerTest(unittest.TestCase):
         self.assertEqual(200, status)
         return response
 
+    def test_gateway_sk_admin_write_only_and_legacy_update(self) -> None:
+        secret = "gwsk_" + base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+        document = self.monitor_request(
+            "gateway-web", "GateWay web", provider="gateway", method="POST",
+            url="https://op.privapi.cc/open/v1/balance/query", jsonPath="data.balance",
+            gatewayAccessKey="gwak_" + "0" * 24, gatewaySecretKey=secret, enabled=False,
+        )
+        path = "/api/v1/admin/monitors"
+        for token in [None, GROUP_TOKEN]:
+            status, response = self.request("POST", path, document, token)
+            self.assertEqual(401, status)
+            self.assertNotIn(secret, json.dumps(response))
+        status, response = self.request("POST", path, document, ADMIN_TOKEN)
+        self.assertEqual(201, status)
+        self.assertTrue(response["monitor"]["gatewaySecretKeyConfigured"])
+        self.assertNotIn(secret, json.dumps(response))
+        for endpoint, token in [(path, ADMIN_TOKEN), ("/api/v1/monitors", GROUP_TOKEN), ("/health", None)]:
+            status, response = self.request("GET", endpoint, token=token)
+            self.assertEqual(200, status)
+            self.assertNotIn(secret, json.dumps(response))
+        status, response = self.request("PUT", path + "/gateway-web", {"name": "From phone"}, ADMIN_TOKEN)
+        self.assertEqual(200, status)
+        self.assertTrue(response["monitor"]["gatewaySecretKeyConfigured"])
+        status, response = self.request("PUT", path + "/gateway-web", {"gatewaySecretKey": secret + "invalid"}, ADMIN_TOKEN)
+        self.assertEqual(400, status)
+        self.assertNotIn(secret, json.dumps(response))
+        with mock.patch("relay_server.gateway_client.call", return_value=(200, {"data": {"balance": "12.5"}})) as call:
+            status, response = self.request("POST", path + "/gateway-web/test", {}, ADMIN_TOKEN)
+        self.assertEqual(200, status)
+        self.assertTrue(response["ok"])
+        self.assertEqual(secret, call.call_args.args[2])
+        self.assertNotIn(secret, json.dumps(response))
+
     @staticmethod
     def monitor_request(
         monitor_id: str,

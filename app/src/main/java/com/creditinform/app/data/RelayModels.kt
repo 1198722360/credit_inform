@@ -1,62 +1,20 @@
 package com.creditinform.app.data
 
-import com.creditinform.app.BuildConfig
-import java.util.UUID
-
 data class RelayConfig(
-    val serverUrl: String = "",
-    val groupId: String = INTERNAL_GROUP_ID,
-    val sharedToken: String = "",
-    val adminToken: String = "",
-    val deviceId: String = UUID.randomUUID().toString(),
-    val deviceName: String = INTERNAL_DEVICE_NAME,
     val enabled: Boolean = false,
     val vibrateEnabled: Boolean = true,
     val soundEnabled: Boolean = true,
     val alarmVolumePercent: Int = 100,
     val ringtoneUri: String = ""
 ) {
-    val isComplete: Boolean
-        get() = serverUrl.length in 1..MAX_URL_LENGTH &&
-            (serverUrl.startsWith("https://") || serverUrl.startsWith("http://")) &&
-            sharedToken.isNotBlank() && isValidIdentifier(deviceId)
-
-    val hasAdminAccess: Boolean
-        get() = (serverUrl.startsWith("https://") || serverUrl.startsWith("http://")) &&
-            serverUrl.length <= MAX_URL_LENGTH &&
-            adminToken.isNotBlank()
-
-    fun normalized(): RelayConfig = copy(
-        serverUrl = serverUrl.trim().trimEnd('/'),
-        groupId = INTERNAL_GROUP_ID,
-        sharedToken = sharedToken.trim(),
-        adminToken = adminToken.trim(),
-        deviceId = deviceId.trim().ifBlank { UUID.randomUUID().toString() },
-        deviceName = INTERNAL_DEVICE_NAME,
-        alarmVolumePercent = alarmVolumePercent.coerceIn(1, 100)
-    )
+    val isComplete: Boolean get() = true
+    val hasAdminAccess: Boolean get() = true
+    fun normalized(): RelayConfig = copy(alarmVolumePercent = alarmVolumePercent.coerceIn(1, 100))
 
     companion object {
-        const val DEFAULT_SERVER_URL = "http://70.39.195.177:8047"
-        // Previous default deployments; saved configs still pointing here follow the move.
-        private val RETIRED_SERVER_URLS = setOf("http://15.204.246.22:8047")
-        const val INTERNAL_GROUP_ID = "customer-service"
-        const val INTERNAL_DEVICE_NAME = "Android 客户端"
         const val MAX_NAME_LENGTH = 128
         const val MAX_URL_LENGTH = 2048
-        private val IDENTIFIER_PATTERN = Regex("^[A-Za-z0-9._-]{1,64}$")
-
-        fun isValidIdentifier(value: String): Boolean = IDENTIFIER_PATTERN.matches(value)
-
-        fun isValidGroupId(value: String): Boolean = isValidIdentifier(value)
-
-        fun migrateServerUrl(value: String): String =
-            if (value.trim().trimEnd('/') in RETIRED_SERVER_URLS) DEFAULT_SERVER_URL else value
-
-        fun freshInstall(): RelayConfig = RelayConfig(
-            serverUrl = DEFAULT_SERVER_URL,
-            sharedToken = BuildConfig.RELAY_DEFAULT_SHARED_TOKEN
-        )
+        fun freshInstall(): RelayConfig = RelayConfig()
     }
 }
 
@@ -71,45 +29,7 @@ data class RelayStatus(
     val state: RelayConnectionState = RelayConnectionState.DISABLED,
     val lastCheckedAt: Long = 0,
     val lastOnlineAt: Long = 0,
-    val lastError: String = "",
-    val onlineClients: Int = 0,
-    val totalClients: Int = 0
-)
-
-data class RelayHealth(
-    val service: String,
-    val version: String,
-    val serverInstanceId: String? = null,
-    val serverTime: Long,
-    val uptimeSeconds: Long,
-    val onlineClients: Int,
-    val totalClients: Int,
-    val heartbeatTimeoutSeconds: Int
-)
-
-data class RelayServerStatus(
-    val serverInstanceId: String? = null,
-    val serverTime: Long,
-    val cursor: Long,
-    val onlineClients: Int,
-    val totalClients: Int
-)
-
-data class RelayClient(
-    val groupId: String,
-    val id: String,
-    val name: String,
-    val lastSeenAt: Long
-)
-
-data class RelayRegistration(
-    val serverTime: Long,
-    val cursor: Long,
-    val client: RelayClient,
-    val onlineClients: Int = 0,
-    val totalClients: Int = 0,
-    val serverInstanceId: String? = null,
-    val cursorToken: String? = null
+    val lastError: String = ""
 )
 
 enum class RelayAlertType(val wireValue: String) {
@@ -154,24 +74,6 @@ data class RelayAlarmEvent(
     }
 }
 
-data class RelaySendResult(
-    val event: RelayAlarmEvent,
-    val recipients: Int,
-    val onlineRecipients: Int,
-    val serverTime: Long
-)
-
-data class RelayPollResult(
-    val events: List<RelayAlarmEvent>,
-    /** Persist this only after all returned events have been stored locally. */
-    val cursor: Long,
-    val headCursor: Long,
-    val serverTime: Long,
-    val serverInstanceId: String? = null,
-    val cursorToken: String? = null,
-    val cursorValid: Boolean = true
-)
-
 data class RemoteMonitorConfigStatus(
     val loaded: Boolean,
     val lastLoadedAt: Long,
@@ -204,7 +106,7 @@ data class RemoteMonitorsResult(
     val monitors: List<RemoteMonitorStatus>
 )
 
-/** Editable server-side monitor. Sensitive values may contain [KEEP_PLACEHOLDER]. */
+/** Monitor configuration stored encrypted on this phone. */
 data class RemoteMonitorConfig(
     val groupId: String,
     val id: String,
@@ -230,7 +132,7 @@ data class RemoteMonitorConfig(
     val enabled: Boolean,
     val provider: String = "http",
     val gatewayAccessKey: String = "",
-    val gatewaySecretKeyEnv: String = "GATEWAY_SK"
+    val gatewaySecretKey: String = ""
 ) {
     companion object {
         const val KEEP_PLACEHOLDER = "__KEEP__"
@@ -259,7 +161,7 @@ data class RemoteMonitorUpsertRequest(
     val revision: Long? = null,
     val provider: String = "http",
     val gatewayAccessKey: String = "",
-    val gatewaySecretKeyEnv: String = "GATEWAY_SK"
+    val gatewaySecretKey: String = ""
 )
 
 data class RemoteMonitorConfigsResult(

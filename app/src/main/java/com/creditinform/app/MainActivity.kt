@@ -164,6 +164,25 @@ private fun RelayAlarmApp() {
     var deleteError by remember { mutableStateOf("") }
     var showConfiguration by rememberSaveable { mutableStateOf(false) }
     var showSendConfirmation by rememberSaveable { mutableStateOf(false) }
+    var importing by remember { mutableStateOf(false) }
+    var importMessage by remember { mutableStateOf("") }
+    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) scope.launch {
+            importing = true
+            importMessage = "正在校验配置并等待当前检测结束…"
+            try {
+                repository.importMonitorConfig(uri).onSuccess { count ->
+                    importMessage = "导入成功，已用 $count 个监控项覆盖原配置"
+                    adminError = ""
+                    Toast.makeText(context, importMessage, Toast.LENGTH_LONG).show()
+                }.onFailure { error ->
+                    importMessage = "导入失败，原监控配置未替换：${error.readableMessage()}"
+                }
+            } finally {
+                importing = false
+            }
+        }
+    }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
@@ -188,9 +207,9 @@ private fun RelayAlarmApp() {
         }
     }
 
-    LaunchedEffect(config.serverUrl, config.adminToken) {
+    LaunchedEffect(Unit) {
         adminError = ""
-        if (config.adminToken.isNotBlank()) {
+        if (config.hasAdminAccess) {
             adminLoading = true
             repository.listRemoteMonitorConfigs().onFailure { error ->
                 adminError = "加载监控配置失败：${error.readableMessage()}"
@@ -243,7 +262,7 @@ private fun RelayAlarmApp() {
                             val reloadResult = repository.listRemoteMonitorConfigs()
                             adminLoading = false
                             adminError = if (reloadResult.isSuccess) {
-                                "配置已被其他客户端修改，已重新加载，请重新编辑"
+                                "配置已更新，已重新加载，请重新编辑"
                             } else {
                                 "配置版本冲突，重新加载失败：${reloadResult.exceptionOrNull()?.readableMessage()}"
                             }
@@ -279,16 +298,16 @@ private fun RelayAlarmApp() {
                     testing = true
                     val connectionResult = repository.testConnection()
                     connectionResult
-                        .onSuccess { health ->
+                        .onSuccess {
                             refreshing = true
                             val syncErrors = mutableListOf<String>()
                             repository.refreshMonitors().onFailure { error ->
-                                syncErrors += "同步监控值失败：${error.readableMessage()}"
+                                syncErrors += "更新监控值失败：${error.readableMessage()}"
                             }
                             if (config.hasAdminAccess) {
                                 adminLoading = true
                                 repository.listRemoteMonitorConfigs().onFailure { error ->
-                                    syncErrors += "同步监控配置失败：${error.readableMessage()}"
+                                    syncErrors += "更新监控配置失败：${error.readableMessage()}"
                                 }
                                 adminLoading = false
                             }
@@ -297,9 +316,9 @@ private fun RelayAlarmApp() {
                             Toast.makeText(
                                 context,
                                 if (syncErrors.isEmpty()) {
-                                    "连接成功，已同步最新值，在线客户端 ${health.onlineClients} 个"
+                                    "本机数据已加载"
                                 } else {
-                                    "连接成功，但部分监控数据同步失败"
+                                    "部分本机数据加载失败"
                                 },
                                 Toast.LENGTH_SHORT
                             ).show()
@@ -307,7 +326,7 @@ private fun RelayAlarmApp() {
                         .onFailure { error ->
                             Toast.makeText(
                                 context,
-                                "连接失败：${error.readableMessage()}",
+                                "检查失败：${error.readableMessage()}",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -339,7 +358,7 @@ private fun RelayAlarmApp() {
                     val errors = mutableListOf<String>()
                     try {
                         if (isAdmin) {
-                            refreshProgressText = "正在检测并同步全部已启用监控…"
+                            refreshProgressText = "正在检测并更新全部已启用监控…"
                             repository.refreshRemoteMonitorValues()
                                 .onSuccess { result ->
                                     if (result.failed > 0) {
@@ -349,12 +368,12 @@ private fun RelayAlarmApp() {
                                 .onFailure { error ->
                                     errors += "检测刷新失败：${error.readableMessage()}"
                                 }
-                            refreshProgressText = "正在同步监控配置…"
+                            refreshProgressText = "正在更新监控配置…"
                             repository.listRemoteMonitorConfigs().onFailure { error ->
-                                errors += "配置同步失败：${error.readableMessage()}"
+                                errors += "配置更新失败：${error.readableMessage()}"
                             }
                         } else {
-                            refreshProgressText = "正在同步最新监控值…"
+                            refreshProgressText = "正在更新最新监控值…"
                             repository.refreshMonitors().onFailure { error ->
                                 errors += "刷新运行状态失败：${error.readableMessage()}"
                             }
@@ -445,7 +464,15 @@ private fun RelayAlarmApp() {
     if (!showMonitorEditor && showConfiguration) {
         RelayConfigurationDialog(
             current = config,
-            busy = testing,
+            busy = testing || importing,
+            importMessage = importMessage,
+            importing = importing,
+            onImport = {
+                importMessage = ""
+                runCatching { importLauncher.launch(arrayOf("*/*")) }.onFailure {
+                    importMessage = "无法打开系统文件选择器"
+                }
+            },
             onDismiss = { showConfiguration = false },
             onSaveAndTest = { candidate ->
                 showConfiguration = false
@@ -466,7 +493,7 @@ private fun RelayAlarmApp() {
                         .onSuccess {
                             Toast.makeText(
                                 context,
-                                "配置已保存，服务端连接正常",
+                                "配置已保存，本机设置已生效",
                                 Toast.LENGTH_SHORT
                             ).show()
                             if (repository.config.value.enabled) {
@@ -478,7 +505,7 @@ private fun RelayAlarmApp() {
                         .onFailure { error ->
                             Toast.makeText(
                                 context,
-                                "配置已保存，连接检测失败：${error.readableMessage()}",
+                                "配置已保存，本机检查失败：${error.readableMessage()}",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -500,21 +527,14 @@ private fun RelayAlarmApp() {
                             showSendConfirmation = false
                             Toast.makeText(
                                 context,
-                                buildString {
-                                    append("服务端已接收报警，当前在线接收端 ")
-                                    append(result.onlineRecipients)
-                                    append(" 个")
-                                    if (result.recipients > result.onlineRecipients) {
-                                        append("（已注册 ").append(result.recipients).append(" 个）")
-                                    }
-                                },
+                                "已触发本机报警",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
                         .onFailure { error ->
                             Toast.makeText(
                                 context,
-                                "发送失败：${error.readableMessage()}",
+                                "触发失败：${error.readableMessage()}",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -729,7 +749,7 @@ private fun RelayHomeScreen(
             if (monitorConfigStatus.lastError.isNotBlank()) {
                 item {
                     Text(
-                        "服务端监控配置异常：${monitorConfigStatus.lastError}",
+                        "本机监控配置异常：${monitorConfigStatus.lastError}",
                         color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodyMedium
                     )
@@ -868,13 +888,13 @@ private fun RelayConnectionCard(
                     onClick = onOpenConfiguration,
                     modifier = Modifier.weight(1f).height(40.dp),
                     contentPadding = PaddingValues(horizontal = 8.dp)
-                ) { Text("连接配置") }
+                ) { Text("监控设置") }
                 Button(
                     onClick = onTestConnection,
                     enabled = config.isCompleteForUi() && !testing,
                     modifier = Modifier.weight(1f).height(40.dp),
                     contentPadding = PaddingValues(horizontal = 8.dp)
-                ) { Text(if (testing) "检测中" else "检测连接") }
+                ) { Text(if (testing) "检测中" else "检查本机") }
             }
         }
     }
@@ -907,7 +927,7 @@ private fun ManualAlarmCard(
                     ),
                     modifier = Modifier.weight(1f).height(44.dp),
                     contentPadding = PaddingValues(horizontal = 8.dp)
-                ) { Text(if (sending) "发送中" else "发送报警", maxLines = 1) }
+                ) { Text(if (sending) "触发中" else "本机报警", maxLines = 1) }
                 OutlinedButton(
                     onClick = onTestLocalAlarm,
                     modifier = Modifier.weight(1f).height(44.dp),
@@ -929,18 +949,18 @@ private fun RemoteMonitorHeader(
 ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(
-            "服务端监控与配置 ($count)",
+            "本机监控与配置 ($count)",
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.weight(1f)
         )
         if (canManage) {
             IconButton(onClick = onCreate, enabled = !loading) {
-                Icon(Icons.Filled.Add, contentDescription = "新增服务端监控")
+                Icon(Icons.Filled.Add, contentDescription = "新增本机监控")
             }
         }
         IconButton(onClick = onRefresh, enabled = canRefresh && !loading) {
-            Icon(Icons.Filled.Refresh, contentDescription = "刷新服务端监控")
+            Icon(Icons.Filled.Refresh, contentDescription = "刷新本机监控")
         }
     }
 }
@@ -1169,10 +1189,10 @@ private fun EmptyMonitorState(
     Card(modifier = Modifier.fillMaxWidth()) {
         Text(
             when {
-                !config.enabled -> "启用通信后可查看服务端监控状态"
-                !config.isCompleteForUi() -> "请先完成服务端连接配置"
-                monitorConfigStatus.loaded -> "服务端当前没有监控端点"
-                else -> "尚未从服务端加载监控状态"
+                !config.enabled -> "点击右上角 + 添加本机监控项"
+                !config.isCompleteForUi() -> "请先完成本机监控设置"
+                monitorConfigStatus.loaded -> "尚未添加监控项，点击右上角 + 开始配置"
+                else -> "尚未添加本机监控项"
             },
             modifier = Modifier.padding(20.dp),
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1222,86 +1242,34 @@ private fun CompactMonitorField(
 private fun RelayConfigurationDialog(
     current: RelayConfig,
     busy: Boolean,
+    importing: Boolean,
+    importMessage: String,
+    onImport: () -> Unit,
     onDismiss: () -> Unit,
     onSaveAndTest: (RelayConfig) -> Unit
 ) {
-    var serverUrl by rememberSaveable { mutableStateOf(current.serverUrl) }
-    var sharedToken by remember(current.sharedToken) { mutableStateOf(current.sharedToken) }
-    var adminToken by remember(current.adminToken) { mutableStateOf(current.adminToken) }
     var enabled by rememberSaveable { mutableStateOf(current.enabled) }
-    var validationError by remember { mutableStateOf("") }
     AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("服务端连接配置") },
+        onDismissRequest = { if (!importing) onDismiss() },
+        title = { Text("本机监控设置") },
         text = {
-            Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                OutlinedTextField(
-                    value = serverUrl,
-                    onValueChange = { serverUrl = it },
-                    label = { Text("服务端地址") },
-                    placeholder = { Text("https://alarm.example.com") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = sharedToken,
-                    onValueChange = { sharedToken = it },
-                    label = { Text("共享密钥") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = adminToken,
-                    onValueChange = { adminToken = it },
-                    label = { Text("管理员密钥（可选）") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = current.deviceId,
-                    onValueChange = { },
-                    label = { Text("客户端 ID") },
-                    readOnly = true,
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+            Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("手机直接查询业务接口，在本机保存配置、判断阈值并报警。")
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("启用通信", modifier = Modifier.weight(1f))
-                    Switch(checked = enabled, onCheckedChange = { enabled = it })
+                    Text("启用本机监控", modifier = Modifier.weight(1f))
+                    Switch(checked = enabled, onCheckedChange = { enabled = it }, enabled = !busy)
                 }
-                if (validationError.isNotBlank()) {
-                    Text(validationError, color = MaterialTheme.colorScheme.error)
+                Text("导入手机上的 JSON 配置，将覆盖全部监控项并清空旧检测记录和报警；铃声、音量和总开关保持不变。")
+                OutlinedButton(onClick = onImport, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
+                    Text(if (importing) "正在导入…" else "导入配置并覆盖")
                 }
+                if (importMessage.isNotBlank()) Text(importMessage, style = MaterialTheme.typography.bodySmall)
             }
         },
         confirmButton = {
-            Button(
-                enabled = !busy,
-                onClick = {
-                    val candidate = current.copy(
-                        serverUrl = serverUrl.trim().trimEnd('/'),
-                        sharedToken = sharedToken.trim(),
-                        adminToken = adminToken.trim(),
-                        enabled = enabled
-                    )
-                    validationError = when {
-                        !candidate.serverUrl.startsWith("https://") &&
-                            !candidate.serverUrl.startsWith("http://") ->
-                            "服务端地址必须以 http:// 或 https:// 开头"
-                        candidate.sharedToken.isBlank() -> "请填写共享密钥"
-                        else -> ""
-                    }
-                    if (validationError.isEmpty()) onSaveAndTest(candidate)
-                }
-            ) { Text("保存并检测") }
+            Button(enabled = !busy, onClick = { onSaveAndTest(current.copy(enabled = enabled)) }) { Text("保存") }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !importing) { Text("取消") } }
     )
 }
 
@@ -1314,10 +1282,10 @@ private fun SendAlarmDialog(
     var message by rememberSaveable { mutableStateOf("请立即联系我，服务可能异常") }
     AlertDialog(
         onDismissRequest = { if (!sending) onDismiss() },
-        title = { Text("发送手动报警？") },
+        title = { Text("触发本机报警？") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("其他客户端会立即响铃。")
+                Text("此手机会立即响铃并振动。")
                 OutlinedTextField(
                     value = message,
                     onValueChange = { if (it.length <= 500) message = it },
@@ -1336,7 +1304,7 @@ private fun SendAlarmDialog(
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError
                 )
-            ) { Text(if (sending) "发送中" else "确认报警") }
+            ) { Text(if (sending) "触发中" else "确认报警") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss, enabled = !sending) { Text("取消") }
@@ -1357,7 +1325,7 @@ private fun DeleteRemoteMonitorDialog(
         title = { Text("删除监控配置？") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("将从服务端永久删除“${monitor.name}”，此操作无法撤销。")
+                Text("将从本机永久删除“${monitor.name}”，此操作无法撤销。")
                 if (error.isNotBlank()) {
                     Text(error, color = MaterialTheme.colorScheme.error)
                 }
@@ -1521,55 +1489,14 @@ private fun relayStatusPresentation(
     config: RelayConfig,
     status: RelayStatus,
     testing: Boolean
-): RelayStatusPresentation {
-    if (!config.enabled) {
-        return RelayStatusPresentation(
-            "通信未启用",
-            "保存完整配置并启用后开始值守",
-            RelayStatusKind.DISABLED
-        )
-    }
-    if (!config.isCompleteForUi()) {
-        return RelayStatusPresentation(
-            "配置待完成",
-            "服务端地址和共享密钥为必填项",
-            RelayStatusKind.OFFLINE
-        )
-    }
-    if (testing || status.state == RelayConnectionState.CHECKING) {
-        return RelayStatusPresentation(
-            "正在检测服务端",
-            "正在验证服务端地址和凭据",
-            RelayStatusKind.CHECKING
-        )
-    }
-    return when (status.state) {
-        RelayConnectionState.ONLINE -> RelayStatusPresentation(
-            "服务端在线",
-            "在线客户端 ${status.onlineClients} 个 | 最近检测 ${formatTimeOrNever(status.lastCheckedAt)}",
-            RelayStatusKind.ONLINE
-        )
-        RelayConnectionState.OFFLINE -> RelayStatusPresentation(
-            "服务端离线",
-            status.lastError.ifBlank { "尚未成功连接服务端" },
-            RelayStatusKind.OFFLINE
-        )
-        RelayConnectionState.CHECKING -> RelayStatusPresentation(
-            "正在检测服务端",
-            "正在验证服务端地址和凭据",
-            RelayStatusKind.CHECKING
-        )
-        RelayConnectionState.DISABLED -> RelayStatusPresentation(
-            "等待服务启动",
-            "配置已启用，正在等待后台通信服务",
-            RelayStatusKind.CHECKING
-        )
-    }
+): RelayStatusPresentation = when {
+    !config.enabled -> RelayStatusPresentation("本机监控已停止", "可编辑本机监控项，启用后自动检测并报警", RelayStatusKind.DISABLED)
+    testing || status.state == RelayConnectionState.CHECKING -> RelayStatusPresentation("正在启动本机监控", "由手机直接查询业务接口", RelayStatusKind.CHECKING)
+    status.state == RelayConnectionState.ONLINE -> RelayStatusPresentation("本机监控运行中", "检测结果请查看各监控项", RelayStatusKind.ONLINE)
+    else -> RelayStatusPresentation("等待本机监控启动", status.lastError.ifBlank { "请启用后台运行权限" }, RelayStatusKind.CHECKING)
 }
 
-private fun RelayConfig.isCompleteForUi(): Boolean =
-    (serverUrl.startsWith("https://") || serverUrl.startsWith("http://")) &&
-        sharedToken.isNotBlank() && RelayConfig.isValidIdentifier(deviceId)
+private fun RelayConfig.isCompleteForUi(): Boolean = true
 
 private fun formatTimeOrNever(timestamp: Long): String =
     if (timestamp <= 0L) "尚无记录" else DateFormat.getDateTimeInstance().format(timestamp)

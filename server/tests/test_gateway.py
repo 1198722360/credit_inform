@@ -193,6 +193,67 @@ class GatewayMonitorTest(unittest.TestCase):
         self.assertTrue(public[0]["breached"])
         self.assertNotIn(SK, json.dumps(public))
 
+    def test_saved_sk_survives_reload_and_is_write_only(self):
+        created = self.manager.create_monitor_config({**self.monitor, "gatewaySecretKey": SK})
+        self.assertTrue(created["gatewaySecretKeyConfigured"])
+        self.assertNotIn("gatewaySecretKey", created)
+        self.assertNotIn(SK, json.dumps(created))
+        self.assertIn(SK, self.store.read_text(encoding="utf-8"))
+        if os.name != "nt":
+            self.assertEqual(0o600, self.store.stat().st_mode & 0o777)
+        self.manager.reload(force=True)
+        with mock.patch.dict(os.environ, {"GATEWAY_TEST_SK": ""}), mock.patch(
+            "gateway_client.urllib.request.OpenerDirector.open", side_effect=responding()
+        ):
+            result = self.manager.test_monitor_config("team", created["id"])
+        self.assertTrue(result["ok"])
+        self.assertNotIn(SK, json.dumps(result))
+        self.assertNotIn(SK, repr(self.manager._definitions))
+        self.assertNotIn(SK, json.dumps(self.manager.list_monitor_configs("team")))
+        self.assertNotIn(SK, json.dumps(self.manager.statuses_for_group("team")))
+
+    def test_blank_and_legacy_updates_keep_sk_and_rotation_takes_effect(self):
+        created = self.manager.create_monitor_config({**self.monitor, "gatewaySecretKey": SK})
+        self.manager.update_monitor_config("team", created["id"], {"name": "Legacy client"})
+        updated = self.manager.update_monitor_config("team", created["id"], {"gatewaySecretKey": "  "})
+        self.assertTrue(updated["gatewaySecretKeyConfigured"])
+        new_sk = "gwsk_" + base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("=")
+        self.manager.update_monitor_config("team", created["id"], {"gatewaySecretKey": new_sk})
+        with mock.patch("gateway_client.call", return_value=(200, {"data": {"balance": "12.5"}})) as call:
+            self.assertTrue(self.manager.test_monitor_config("team", created["id"])["ok"])
+        self.assertEqual(new_sk, call.call_args.args[2])
+        self.assertNotIn(SK, self.store.read_text(encoding="utf-8"))
+
+    def test_copy_keeps_saved_sk_private_and_delete_removes_it(self):
+        created = self.manager.create_monitor_config({**self.monitor, "gatewaySecretKey": SK})
+        copied = self.manager.copy_monitor_config("team", created["id"])
+        self.assertTrue(copied["gatewaySecretKeyConfigured"])
+        self.assertFalse(copied["enabled"])
+        self.assertNotIn(SK, json.dumps(copied))
+        self.manager.delete_monitor_config("team", created["id"])
+        with mock.patch.dict(os.environ, {"GATEWAY_TEST_SK": ""}), mock.patch(
+            "gateway_client.urllib.request.OpenerDirector.open", side_effect=responding()
+        ):
+            self.assertTrue(self.manager.test_monitor_config("team", copied["id"])["ok"])
+        self.manager.delete_monitor_config("team", copied["id"])
+        self.assertNotIn(SK, self.store.read_text(encoding="utf-8"))
+
+    def test_invalid_sk_or_failed_save_does_not_replace_working_credential(self):
+        created = self.manager.create_monitor_config({**self.monitor, "gatewaySecretKey": SK})
+        before = self.store.read_bytes()
+        for invalid in ["private-secret-invalid", 42, None]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError) as error:
+                self.manager.update_monitor_config("team", created["id"], {"gatewaySecretKey": invalid})
+            self.assertNotIn(str(invalid), str(error.exception))
+            self.assertEqual(before, self.store.read_bytes())
+        with mock.patch("relay_server.atomic_write_json", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.manager.update_monitor_config("team", created["id"], {"gatewaySecretKey": "gwsk_" + "A" * 43})
+        self.assertEqual(before, self.store.read_bytes())
+        with mock.patch("gateway_client.call", return_value=(200, {"data": {"balance": "12.5"}})) as call:
+            self.assertTrue(self.manager.test_monitor_config("team", created["id"])["ok"])
+        self.assertEqual(SK, call.call_args.args[2])
+
     def test_decimal_conversion_and_comparison_are_exact(self):
         self.manager.create_monitor_config({**self.monitor, "multiplier": 3, "threshold": 0.3, "operator": "="})
         with mock.patch("gateway_client.urllib.request.OpenerDirector.open", side_effect=responding({"balance": "0.1"})):
