@@ -101,7 +101,7 @@ class RelayService : Service() {
         while (currentCoroutineContext().isActive) {
             scheduleRestart(this@RelayService)
             repository.checkDueMonitors().onSuccess {
-                if (storageAlarmRaised) {
+                if (storageAlarmRaised && repository.status.value.state == RelayConnectionState.ONLINE) {
                     storageAlarmRaised = false
                     AlarmController.dismiss(this, AlarmController.RELAY_CONFIG_ALERT_ID)
                 }

@@ -49,8 +49,8 @@ class RelayRepository private constructor(context: Context) {
     val status = _status.asStateFlow()
 
     init {
-        // The server owns all upstream configuration. Do not retain legacy local keys.
-        check(preferences.edit().remove("local_document_v1").commit()) { "无法清除旧本地凭据" }
+        // Legacy local data stays quarantined until the first successful server sync.
+        // It is never loaded or executed by this client, so a failed migration is recoverable.
         saveConfig(_config.value)
     }
 
@@ -196,6 +196,7 @@ class RelayRepository private constructor(context: Context) {
                         item.result.exceptionOrNull()?.let { RemoteMonitorRefreshError("CHECK_FAILED", it.message.orEmpty(), null) })
                 }
                 persist(snapshot.monitors.map { it.config }, nextStates, pending)
+                check(preferences.edit().remove("local_document_v1").commit()) { "无法清除旧本地凭据" }
                 nextSyncAt = now + snapshot.intervalSeconds * 1000
                 _monitorConfigStatus.value = RemoteMonitorConfigStatus(true, now, "")
                 _status.value = RelayStatus(if (config.value.enabled) RelayConnectionState.ONLINE else RelayConnectionState.DISABLED,

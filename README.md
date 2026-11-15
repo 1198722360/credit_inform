@@ -8,7 +8,7 @@ Android App 从 sub2api 的只读余额 API 拉取渠道、余额、检测时间
 
 接口为 `GET /api/v1/upstream-balance/status`，使用 `Authorization: Bearer <查询令牌>`。App 不使用 sub2api 管理员 token，不允许重定向转发凭据。仅 loopback 支持 HTTP，供开发测试或 SSH 隧道使用。白名单校验的是手机实际公网出口；若通过 `104.238.222.175` 出口联网，应将该地址加入白名单。
 
-升级后会删除旧本机监控配置中的上游凭据，保留声音、振动和音量设置；需重新填写服务端连接。App 不会把旧凭据自动上传。新增、编辑和删除渠道统一在 sub2api 管理页面完成。后台按服务端间隔轮询，过期余额会报告异常；重复快照不会重复累计查询失败。服务端/API 连接故障使用本机紧急提醒，余额阈值告警保留未确认队列。
+升级后旧本机监控配置被隔离，不再执行；首次成功连接服务端并保存快照后，才清除旧配置中的上游凭据。保留声音、振动和音量设置，需重新填写服务端连接。App 不会把旧凭据自动上传。新增、编辑和删除渠道统一在 sub2api 管理页面完成。后台按服务端间隔轮询，过期余额会报告异常；重复快照不会重复累计上游查询失败。服务端/API 连接故障使用本机紧急提醒，余额阈值告警保留未确认队列。重试等待期间不会提前解除连接故障报警。
 
 构建验证：`JAVA_HOME=$(/usr/libexec/java_home -v 17) ./gradlew testDebugUnitTest assembleDebug lintDebug`。APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。
 
@@ -41,6 +41,8 @@ Android App 从 sub2api 的只读余额 API 拉取渠道、余额、检测时间
 APK：`app/build/outputs/apk/debug/app-debug.apk`。
 
 导入配置：进入「监控设置」→「导入配置并覆盖」，从手机文件选择器中选择 UTF-8 JSON 文件。示例见 [config.local.example.json](config.local.example.json)。支持包含 `monitors` 数组的对象（兼容旧服务器配置）或直接提供监控数组；支持 `headers` 对象或 `headersJson`，以及字符串／对象／数组请求体。GateWay 必须提供 `gatewayAccessKey` 和 `gatewaySecretKey` 的实际值，服务器环境变量名不能替代 SK。
+
+JSON 路径支持按数组字段精确选择，例如 `balance_infos[currency=CNY].total_balance`，避免上游币种顺序变化导致读错余额。字段名支持字母、数字和下划线（不能以数字开头），筛选值支持字母、数字、下划线和连字符；必须恰好匹配一项，否则检测报错。此语法需安装支持该功能的新 APK。
 
 文件最多 1 MiB、500 个监控项。全部校验成功后，按文件顺序覆盖原监控列表，清空旧检测状态及未确认报警；铃声、音量和监控总开关保持不变。空的 `monitors` 数组会清空监控列表。文件无效或取消选择不会覆盖原配置。导入会等待当前检测批次结束；如总开关已启用，随后自动按新配置继续检测。文件读取、校验和加密保存均在本机完成。
 
