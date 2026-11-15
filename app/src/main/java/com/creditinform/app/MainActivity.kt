@@ -164,25 +164,6 @@ private fun RelayAlarmApp() {
     var deleteError by remember { mutableStateOf("") }
     var showConfiguration by rememberSaveable { mutableStateOf(false) }
     var showSendConfirmation by rememberSaveable { mutableStateOf(false) }
-    var importing by remember { mutableStateOf(false) }
-    var importMessage by remember { mutableStateOf("") }
-    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) scope.launch {
-            importing = true
-            importMessage = "正在校验配置并等待当前检测结束…"
-            try {
-                repository.importMonitorConfig(uri).onSuccess { count ->
-                    importMessage = "导入成功，已用 $count 个监控项覆盖原配置"
-                    adminError = ""
-                    Toast.makeText(context, importMessage, Toast.LENGTH_LONG).show()
-                }.onFailure { error ->
-                    importMessage = "导入失败，原监控配置未替换：${error.readableMessage()}"
-                }
-            } finally {
-                importing = false
-            }
-        }
-    }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
@@ -316,9 +297,9 @@ private fun RelayAlarmApp() {
                             Toast.makeText(
                                 context,
                                 if (syncErrors.isEmpty()) {
-                                    "本机数据已加载"
+                                    "服务端余额已更新"
                                 } else {
-                                    "部分本机数据加载失败"
+                                    "部分余额加载失败"
                                 },
                                 Toast.LENGTH_SHORT
                             ).show()
@@ -464,15 +445,7 @@ private fun RelayAlarmApp() {
     if (!showMonitorEditor && showConfiguration) {
         RelayConfigurationDialog(
             current = config,
-            busy = testing || importing,
-            importMessage = importMessage,
-            importing = importing,
-            onImport = {
-                importMessage = ""
-                runCatching { importLauncher.launch(arrayOf("*/*")) }.onFailure {
-                    importMessage = "无法打开系统文件选择器"
-                }
-            },
+            busy = testing,
             onDismiss = { showConfiguration = false },
             onSaveAndTest = { candidate ->
                 showConfiguration = false
@@ -493,7 +466,7 @@ private fun RelayAlarmApp() {
                         .onSuccess {
                             Toast.makeText(
                                 context,
-                                "配置已保存，本机设置已生效",
+                                "配置已保存，服务端连接成功",
                                 Toast.LENGTH_SHORT
                             ).show()
                             if (repository.config.value.enabled) {
@@ -505,7 +478,7 @@ private fun RelayAlarmApp() {
                         .onFailure { error ->
                             Toast.makeText(
                                 context,
-                                "配置已保存，本机检查失败：${error.readableMessage()}",
+                                "配置已保存，连接失败：${error.readableMessage()}",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -749,7 +722,7 @@ private fun RelayHomeScreen(
             if (monitorConfigStatus.lastError.isNotBlank()) {
                 item {
                     Text(
-                        "本机监控配置异常：${monitorConfigStatus.lastError}",
+                        "服务端余额监控异常：${monitorConfigStatus.lastError}",
                         color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodyMedium
                     )
@@ -949,7 +922,7 @@ private fun RemoteMonitorHeader(
 ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         Text(
-            "本机监控与配置 ($count)",
+            "上游余额 ($count)",
             style = MaterialTheme.typography.titleLarge,
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.weight(1f)
@@ -960,7 +933,7 @@ private fun RemoteMonitorHeader(
             }
         }
         IconButton(onClick = onRefresh, enabled = canRefresh && !loading) {
-            Icon(Icons.Filled.Refresh, contentDescription = "刷新本机监控")
+            Icon(Icons.Filled.Refresh, contentDescription = "刷新上游余额")
         }
     }
 }
@@ -1081,7 +1054,7 @@ private fun UnifiedRemoteMonitorCard(
                 )
             }
             Text(
-                "地址：" + (address.takeIf(String::isNotBlank)?.let {
+                if (!canManage) "来源：sub2api 服务端" else "地址：" + (address.takeIf(String::isNotBlank)?.let {
                     if (canManage) it else displayMaskedMonitorUrl(it)
                 } ?: "未配置"),
                 style = MaterialTheme.typography.bodySmall,
@@ -1189,10 +1162,10 @@ private fun EmptyMonitorState(
     Card(modifier = Modifier.fillMaxWidth()) {
         Text(
             when {
-                !config.enabled -> "点击右上角 + 添加本机监控项"
-                !config.isCompleteForUi() -> "请先完成本机监控设置"
-                monitorConfigStatus.loaded -> "尚未添加监控项，点击右上角 + 开始配置"
-                else -> "尚未添加本机监控项"
+                !config.enabled -> "打开监控设置，连接 sub2api 并启用余额监控"
+                !config.isCompleteForUi() -> "请先配置 sub2api 地址和余额查询令牌"
+                monitorConfigStatus.loaded -> "服务端尚未配置上游余额监控"
+                else -> "尚未拉取服务端上游余额"
             },
             modifier = Modifier.padding(20.dp),
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1242,34 +1215,41 @@ private fun CompactMonitorField(
 private fun RelayConfigurationDialog(
     current: RelayConfig,
     busy: Boolean,
-    importing: Boolean,
-    importMessage: String,
-    onImport: () -> Unit,
     onDismiss: () -> Unit,
     onSaveAndTest: (RelayConfig) -> Unit
 ) {
     var enabled by rememberSaveable { mutableStateOf(current.enabled) }
+    var serverUrl by remember { mutableStateOf(current.serverUrl) }
+    var apiToken by remember { mutableStateOf(current.apiToken) }
+    val validUrl = runCatching {
+        com.creditinform.app.network.ServerBalanceClient.validateServerUrl(serverUrl.trim())
+    }.isSuccess
     AlertDialog(
-        onDismissRequest = { if (!importing) onDismiss() },
-        title = { Text("本机监控设置") },
+        onDismissRequest = { if (!busy) onDismiss() },
+        title = { Text("余额监控连接") },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("手机直接查询业务接口，在本机保存配置、判断阈值并报警。")
+                Text("从 sub2api 获取上游余额和报警规则。上游密钥保留在服务器，手机只保存余额查询令牌。")
+                OutlinedTextField(value = serverUrl, onValueChange = { serverUrl = it },
+                    label = { Text("sub2api 地址（HTTPS）") }, singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = apiToken, onValueChange = { apiToken = it },
+                    label = { Text("余额查询令牌") }, singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text("启用本机监控", modifier = Modifier.weight(1f))
+                    Text("启用余额监控", modifier = Modifier.weight(1f))
                     Switch(checked = enabled, onCheckedChange = { enabled = it }, enabled = !busy)
                 }
-                Text("导入手机上的 JSON 配置，将覆盖全部监控项并清空旧检测记录和报警；铃声、音量和总开关保持不变。")
-                OutlinedButton(onClick = onImport, enabled = !busy, modifier = Modifier.fillMaxWidth()) {
-                    Text(if (importing) "正在导入…" else "导入配置并覆盖")
-                }
-                if (importMessage.isNotBlank()) Text(importMessage, style = MaterialTheme.typography.bodySmall)
+                Text("渠道、凭据和阈值请在 sub2api 上游余额管理页面配置；手机负责定时拉取和本机报警。")
             }
         },
         confirmButton = {
-            Button(enabled = !busy, onClick = { onSaveAndTest(current.copy(enabled = enabled)) }) { Text("保存") }
+            Button(enabled = !busy && validUrl && apiToken.isNotBlank(),
+                onClick = { onSaveAndTest(current.copy(enabled = enabled, serverUrl = serverUrl, apiToken = apiToken)) }) {
+                Text("保存并连接")
+            }
         },
-        dismissButton = { TextButton(onClick = onDismiss, enabled = !importing) { Text("取消") } }
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("取消") } }
     )
 }
 
@@ -1490,13 +1470,15 @@ private fun relayStatusPresentation(
     status: RelayStatus,
     testing: Boolean
 ): RelayStatusPresentation = when {
-    !config.enabled -> RelayStatusPresentation("本机监控已停止", "可编辑本机监控项，启用后自动检测并报警", RelayStatusKind.DISABLED)
-    testing || status.state == RelayConnectionState.CHECKING -> RelayStatusPresentation("正在启动本机监控", "由手机直接查询业务接口", RelayStatusKind.CHECKING)
-    status.state == RelayConnectionState.ONLINE -> RelayStatusPresentation("本机监控运行中", "检测结果请查看各监控项", RelayStatusKind.ONLINE)
+    !config.enabled -> RelayStatusPresentation("余额监控已停止", "启用后从 sub2api 拉取余额并在本机报警", RelayStatusKind.DISABLED)
+    !config.isComplete -> RelayStatusPresentation("尚未配置连接", "请填写 sub2api 地址和余额查询令牌", RelayStatusKind.DISABLED)
+    testing || status.state == RelayConnectionState.CHECKING -> RelayStatusPresentation("正在连接 sub2api", "余额查询在服务器执行", RelayStatusKind.CHECKING)
+    status.state == RelayConnectionState.ONLINE -> RelayStatusPresentation("服务端余额已连接", "上游凭据保留在服务器", RelayStatusKind.ONLINE)
+    status.state == RelayConnectionState.OFFLINE -> RelayStatusPresentation("余额服务连接异常", status.lastError, RelayStatusKind.OFFLINE)
     else -> RelayStatusPresentation("等待本机监控启动", status.lastError.ifBlank { "请启用后台运行权限" }, RelayStatusKind.CHECKING)
 }
 
-private fun RelayConfig.isCompleteForUi(): Boolean = true
+private fun RelayConfig.isCompleteForUi(): Boolean = isComplete
 
 private fun formatTimeOrNever(timestamp: Long): String =
     if (timestamp <= 0L) "尚无记录" else DateFormat.getDateTimeInstance().format(timestamp)

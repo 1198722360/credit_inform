@@ -1,23 +1,17 @@
 package com.creditinform.app.data
 
 import android.content.Context
-import android.net.Uri
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
-import com.creditinform.app.network.LocalMonitorClient
+import com.creditinform.app.network.ServerBalanceClient
 import com.creditinform.app.network.RelayApiException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -30,12 +24,12 @@ import javax.crypto.spec.GCMParameterSpec
 
 /** All settings, monitor state and pending alarms belong to this device. */
 class RelayRepository private constructor(context: Context) {
-    private val appContext = context.applicationContext
     private val preferences = context.applicationContext.getSharedPreferences("credit_inform_relay", Context.MODE_PRIVATE)
     private val lock = Any()
     private val checkMutex = Mutex()
     private var configGeneration = 0L
-    private val client = LocalMonitorClient()
+    private val client = ServerBalanceClient()
+    private var nextSyncAt = 0L
     private var loadError = ""
     private val initial = loadDocument()
     private val _config = MutableStateFlow(loadConfig())
@@ -55,12 +49,13 @@ class RelayRepository private constructor(context: Context) {
     val status = _status.asStateFlow()
 
     init {
-        // Overwrite old connection settings without reading or using the old server credentials.
+        // The server owns all upstream configuration. Do not retain legacy local keys.
+        check(preferences.edit().remove("local_document_v1").commit()) { "无法清除旧本地凭据" }
         saveConfig(_config.value)
     }
 
     private fun loadDocument(): JSONObject = try {
-        val document = preferences.getString("local_document_v1", null)?.let { JSONObject(decryptSecret(it)) } ?: JSONObject()
+        val document = preferences.getString("server_balances_v1", null)?.let { JSONObject(decryptSecret(it)) } ?: JSONObject()
         readArray(document.optJSONArray("monitors"), ::localMonitorFromJson)
         readArray(document.optJSONArray("pending")) { it.toRelayAlarmEvent() }
         document.optJSONObject("states")?.let { states ->
@@ -74,41 +69,32 @@ class RelayRepository private constructor(context: Context) {
 
     private fun loadConfig(): RelayConfig {
         val j = runCatching { JSONObject(preferences.getString("config", "{}") ?: "{}") }.getOrDefault(JSONObject())
-        return RelayConfig(enabled = j.optBoolean("enabled"), soundEnabled = j.optBoolean("soundEnabled", true),
+        val token = runCatching { decryptSecret(j.optString("balanceApiToken")) }.getOrDefault("")
+        return RelayConfig(enabled = j.optBoolean("enabled") && j.optString("serverUrl").isNotBlank() && token.isNotBlank(), soundEnabled = j.optBoolean("soundEnabled", true),
             vibrateEnabled = j.optBoolean("vibrateEnabled", true), alarmVolumePercent = j.optInt("alarmVolumePercent", 100),
-            ringtoneUri = j.optString("ringtoneUri")).normalized()
+            ringtoneUri = j.optString("ringtoneUri"), serverUrl = j.optString("serverUrl"),
+            apiToken = token).normalized()
     }
 
     fun saveConfig(value: RelayConfig) = synchronized(lock) {
         val normalized = value.normalized()
+        if (normalized.serverUrl.isNotEmpty()) ServerBalanceClient.validateServerUrl(normalized.serverUrl)
+        require(!normalized.enabled || normalized.isComplete) { "请填写 sub2api 地址和余额查询令牌" }
+        val changedServer = normalized.serverUrl != _config.value.serverUrl || normalized.apiToken != _config.value.apiToken
         val j = JSONObject().put("enabled", normalized.enabled).put("soundEnabled", normalized.soundEnabled)
             .put("vibrateEnabled", normalized.vibrateEnabled).put("alarmVolumePercent", normalized.alarmVolumePercent)
-            .put("ringtoneUri", normalized.ringtoneUri)
+            .put("ringtoneUri", normalized.ringtoneUri).put("serverUrl", normalized.serverUrl)
+            .put("balanceApiToken", encryptSecret(normalized.apiToken))
         check(preferences.edit().putString("config", j.toString()).commit()) { "无法保存本机设置或参数无效" }
+        if (changedServer) persist(emptyList(), emptyMap(), emptyList())
+        else if (normalized.enabled && !_config.value.enabled) persist(nextStates = emptyMap())
         _config.value = normalized
+        nextSyncAt = 0L
         configGeneration++
         _status.value = RelayStatus(if (normalized.enabled) RelayConnectionState.CHECKING else RelayConnectionState.DISABLED)
     }
 
     fun setEnabled(enabled: Boolean) = saveConfig(config.value.copy(enabled = enabled))
-
-    suspend fun importMonitorConfig(uri: Uri): Result<Int> = operation {
-        val text = appContext.contentResolver.openInputStream(uri)?.use(MonitorConfigImport::read)
-            ?: error("无法打开所选配置文件")
-        val imported = MonitorConfigImport.parse(text)
-        // Wait for the current batch, then replace all data in one durable write. No old
-        // queued checks can publish after the replacement or sound an obsolete alarm.
-        checkMutex.withLock {
-            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                synchronized(lock) {
-                    persist(imported, emptyMap(), emptyList())
-                    configGeneration++
-                }
-                com.creditinform.app.monitoring.AlarmController.dismissAll(appContext)
-            }
-        }
-        imported.size
-    }
 
     private fun persist(monitors: List<RemoteMonitorConfig> = _remoteMonitorConfigs.value,
                         nextStates: Map<String, LocalMonitorState> = states,
@@ -117,7 +103,7 @@ class RelayRepository private constructor(context: Context) {
         val document = JSONObject().put("monitors", JSONArray().apply { monitors.forEach { put(it.toLocalJson()) } })
             .put("states", JSONObject().apply { nextStates.forEach { (id, state) -> put(id, state.toJson()) } })
             .put("pending", JSONArray().apply { pending.forEach { put(it.toJson()) } })
-        check(preferences.edit().putString("local_document_v1", encryptSecret(document.toString())).commit()) { "无法保存本机监控数据" }
+        check(preferences.edit().putString("server_balances_v1", encryptSecret(document.toString())).commit()) { "无法保存本机监控数据" }
         states = nextStates
         _remoteMonitorConfigs.value = monitors
         _pendingEvents.value = pending
@@ -133,62 +119,24 @@ class RelayRepository private constructor(context: Context) {
         if (_pendingEvents.value.isNotEmpty()) persist(pending = emptyList())
     }
 
-    suspend fun testConnection(): Result<Unit> = operation { check(loadError.isEmpty()) { loadError } }
+    suspend fun testConnection(): Result<Unit> = operation {
+        checkMutex.withLock { syncBalances(config.value.enabled) }
+        Unit
+    }
     suspend fun refreshMonitors(): Result<RemoteMonitorsResult> = operation {
+        checkMutex.withLock { syncBalances(config.value.enabled) }
         RemoteMonitorsResult(System.currentTimeMillis(), _monitorConfigStatus.value, _monitorStatuses.value)
     }
     suspend fun listRemoteMonitorConfigs(): Result<RemoteMonitorConfigsResult> = operation {
-        check(loadError.isEmpty()) { loadError }; configsResult()
-    }
-    private fun configsResult() = RemoteMonitorConfigsResult(System.currentTimeMillis(), "", _remoteMonitorConfigs.value)
-
-    suspend fun createRemoteMonitor(request: RemoteMonitorUpsertRequest) = saveMonitor(null, request)
-    suspend fun updateRemoteMonitor(id: String, request: RemoteMonitorUpsertRequest) = saveMonitor(id, request)
-    private suspend fun saveMonitor(id: String?, request: RemoteMonitorUpsertRequest): Result<RemoteMonitorMutationResult> = operation {
-        synchronized(lock) {
-            validateMonitorRequest(request)
-            val old = id?.let { key -> _remoteMonitorConfigs.value.firstOrNull { it.id == key } ?: error("监控不存在") }
-            if (old != null && request.revision != null && old.revision != request.revision) throw RelayApiException(409, "配置已更新，请重新打开编辑")
-            val body = if (request.bodySpecified) request.body else old?.body
-            val monitor = RemoteMonitorConfig("local", id ?: UUID.randomUUID().toString(), (old?.revision ?: 0) + 1,
-                System.currentTimeMillis(), request.name, request.url, request.method, request.headersJson ?: old?.headersJson,
-                body, headersConfigured = !request.headersJson.isNullOrBlank(), bodyConfigured = body != null,
-                jsonPath = request.jsonPath, operator = request.operator, threshold = request.threshold,
-                multiplier = request.multiplier, offset = request.offset, pollIntervalSeconds = request.pollIntervalSeconds,
-                timeoutSeconds = request.timeoutSeconds, errorThreshold = request.errorThreshold, repeatAlertSeconds = request.repeatAlertSeconds,
-                enabled = request.enabled, provider = request.provider, gatewayAccessKey = request.gatewayAccessKey,
-                gatewaySecretKey = request.gatewaySecretKey)
-            val monitors = if (old == null) _remoteMonitorConfigs.value + monitor else _remoteMonitorConfigs.value.map { if (it.id == id) monitor else it }
-            persist(monitors, states - monitor.id)
-            RemoteMonitorMutationResult(System.currentTimeMillis(), "", monitor)
-        }
+        RemoteMonitorConfigsResult(System.currentTimeMillis(), "", _remoteMonitorConfigs.value)
     }
 
-    suspend fun deleteRemoteMonitor(id: String): Result<RemoteMonitorDeleteResult> = operation {
-        synchronized(lock) {
-            persist(_remoteMonitorConfigs.value.filterNot { it.id == id }, states - id)
-            RemoteMonitorDeleteResult(System.currentTimeMillis())
-        }
-    }
-    suspend fun copyRemoteMonitor(id: String): Result<RemoteMonitorMutationResult> = operation {
-        synchronized(lock) {
-            val list = _remoteMonitorConfigs.value.toMutableList()
-            val index = list.indexOfFirst { it.id == id }
-            require(index >= 0) { "监控不存在" }
-            val copy = list[index].copy(id = UUID.randomUUID().toString(), name = list[index].name.take(120) + " 副本", revision = 1)
-            list.add(index + 1, copy)
-            persist(list)
-            RemoteMonitorMutationResult(System.currentTimeMillis(), "", copy)
-        }
-    }
-    suspend fun reorderRemoteMonitors(expectedMonitorIds: List<String>, monitorIds: List<String>): Result<RemoteMonitorConfigsResult> = operation {
-        synchronized(lock) {
-            val list = _remoteMonitorConfigs.value
-            require(expectedMonitorIds == list.map { it.id } && monitorIds.size == list.size && monitorIds.toSet() == expectedMonitorIds.toSet()) { "监控列表已变更或检测参数无效" }
-            persist(monitorIds.map { id -> list.first { it.id == id } })
-            configsResult()
-        }
-    }
+    private fun readOnly(): Nothing = error("请在 sub2api 上游余额页面管理监控")
+    suspend fun createRemoteMonitor(request: RemoteMonitorUpsertRequest): Result<RemoteMonitorMutationResult> = operation { readOnly() }
+    suspend fun updateRemoteMonitor(id: String, request: RemoteMonitorUpsertRequest): Result<RemoteMonitorMutationResult> = operation { readOnly() }
+    suspend fun deleteRemoteMonitor(id: String): Result<RemoteMonitorDeleteResult> = operation { readOnly() }
+    suspend fun copyRemoteMonitor(id: String): Result<RemoteMonitorMutationResult> = operation { readOnly() }
+    suspend fun reorderRemoteMonitors(expectedMonitorIds: List<String>, monitorIds: List<String>): Result<RemoteMonitorConfigsResult> = operation { readOnly() }
 
     suspend fun sendAlarm(message: String): Result<Unit> = operation {
         synchronized(lock) {
@@ -200,51 +148,71 @@ class RelayRepository private constructor(context: Context) {
         System.currentTimeMillis(), type, "local", "local", "本机", message, System.currentTimeMillis(),
         monitor?.id, monitor?.name, UUID.randomUUID().toString())
 
-    suspend fun testRemoteMonitor(id: String): Result<RemoteMonitorTestResult> = operation {
-        checkMutex.withLock {
-            val monitor = _remoteMonitorConfigs.value.firstOrNull { it.id == id } ?: error("监控不存在")
-            checkOne(monitor, false).getOrThrow()
-        }
-    }
+    suspend fun testRemoteMonitor(id: String): Result<RemoteMonitorTestResult> = operation { readOnly() }
     suspend fun refreshRemoteMonitorValues(): Result<RemoteMonitorRefreshResult> = operation {
-        checkMutex.withLock { checkAll(false) }
+        checkMutex.withLock { syncBalances(config.value.enabled) }
     }
     suspend fun checkDueMonitors(): Result<RemoteMonitorRefreshResult> = operation {
-        checkMutex.withLock { checkAll(true) }
+        checkMutex.withLock {
+            if (System.currentTimeMillis() < nextSyncAt || !config.value.enabled) {
+                RemoteMonitorRefreshResult(true, System.currentTimeMillis(), 0, 0, 0, emptyList())
+            } else syncBalances(true)
+        }
     }
-    private suspend fun checkAll(dueOnly: Boolean): RemoteMonitorRefreshResult = coroutineScope {
+
+    private fun syncBalances(allowAlarm: Boolean): RemoteMonitorRefreshResult {
         check(loadError.isEmpty()) { loadError }
-        val now = System.currentTimeMillis()
-        val monitors = synchronized(lock) {
-            _remoteMonitorConfigs.value.filter { it.enabled && (!dueOnly || (config.value.enabled && (states[it.id]?.nextAt ?: 0) <= now)) }
-        }
-        val semaphore = Semaphore(4)
-        val results = monitors.map { monitor -> async {
-            semaphore.withPermit {
-                val result = checkOne(monitor, true)
-                val value = result.getOrNull()
-                RemoteMonitorRefreshItemResult(monitor.id, monitor.name, result.isSuccess,
-                    value?.let { RemoteMonitorRefreshCheckResult(it.httpCode, it.rawValue, it.value, it.breached) },
-                    result.exceptionOrNull()?.let { RemoteMonitorRefreshError("CHECK_FAILED", it.message.orEmpty(), (it as? RelayApiException)?.httpCode) })
-            }
-        } }.awaitAll()
-        _status.value = RelayStatus(if (config.value.enabled) RelayConnectionState.ONLINE else RelayConnectionState.DISABLED,
-            lastCheckedAt = System.currentTimeMillis())
-        RemoteMonitorRefreshResult(results.all { it.ok }, System.currentTimeMillis(), results.size, results.count { it.ok }, results.count { !it.ok }, results)
-    }
-    private fun checkOne(monitor: RemoteMonitorConfig, allowAlarm: Boolean): Result<RemoteMonitorTestResult> {
+        val requestConfig = config.value
+        require(requestConfig.isComplete) { "请配置 sub2api 地址和余额查询令牌" }
         val generation = synchronized(lock) { configGeneration }
-        val result = runCatching { client.check(monitor) }
-        synchronized(lock) {
-            // Editing, deleting or disabling during a request invalidates its result.
-            if (generation != configGeneration || _remoteMonitorConfigs.value.firstOrNull { it.id == monitor.id } != monitor) return result
-            val previous = states[monitor.id] ?: LocalMonitorState()
-            val (next, alarm) = previous.checked(monitor, result, System.currentTimeMillis(), allowAlarm && config.value.enabled && monitor.enabled)
-            val pending = if (alarm == null || _pendingEvents.value.any { it.monitorId == monitor.id && it.type == alarm }) _pendingEvents.value
-                else _pendingEvents.value + event(monitor, alarm, if (alarm == RelayAlertType.MONITOR_BREACH) "当前值 ${next.value}，报警条件 ${monitor.operator} ${monitor.threshold}" else "连续 ${next.errors} 次检测失败：${next.error}")
-            persist(nextStates = states + (monitor.id to next), pending = pending)
+        val now = System.currentTimeMillis()
+        // A connection failure must back off too, otherwise the service loop retries each second.
+        nextSyncAt = now + 60_000
+        try {
+            val snapshot = client.fetch(requestConfig)
+            synchronized(lock) {
+                if (generation != configGeneration) return RemoteMonitorRefreshResult(true, now, 0, 0, 0, emptyList())
+                val nextStates = mutableMapOf<String, LocalMonitorState>()
+                var pending = _pendingEvents.value.filter { event -> event.monitorId == null || snapshot.monitors.any { it.config.id == event.monitorId && it.config.enabled } }
+                val results = snapshot.monitors.map { item ->
+                    val monitor = item.config
+                    val previous = states[monitor.id] ?: LocalMonitorState()
+                    // Cached snapshots are not new checks: never inflate failure counts or repeat alarms.
+                    val checkedAt = item.checkedAt
+                    val next = if (checkedAt > previous.checkedAt && monitor.enabled) {
+                        val (updated, alarm) = previous.checked(monitor, item.result, checkedAt,
+                            allowAlarm && config.value.enabled)
+                        if (alarm != null && pending.none { it.monitorId == monitor.id && it.type == alarm }) {
+                            pending = pending + event(monitor, alarm, if (alarm == RelayAlertType.MONITOR_BREACH)
+                                "当前余额 ${updated.value}，报警条件 ${monitor.operator} ${monitor.threshold}"
+                                else "连续 ${updated.errors} 次查询失败：${updated.error}")
+                        }
+                        updated
+                    } else previous
+                    nextStates[monitor.id] = next
+                    val value = item.result.getOrNull()
+                    RemoteMonitorRefreshItemResult(monitor.id, monitor.name, item.result.isSuccess,
+                        value?.let { RemoteMonitorRefreshCheckResult(it.httpCode, it.rawValue, it.value, it.breached) },
+                        item.result.exceptionOrNull()?.let { RemoteMonitorRefreshError("CHECK_FAILED", it.message.orEmpty(), null) })
+                }
+                persist(snapshot.monitors.map { it.config }, nextStates, pending)
+                nextSyncAt = now + snapshot.intervalSeconds * 1000
+                _monitorConfigStatus.value = RemoteMonitorConfigStatus(true, now, "")
+                _status.value = RelayStatus(if (config.value.enabled) RelayConnectionState.ONLINE else RelayConnectionState.DISABLED,
+                    lastCheckedAt = now, lastOnlineAt = now)
+                return RemoteMonitorRefreshResult(results.all { it.ok }, now, results.size,
+                    results.count { it.ok }, results.count { !it.ok }, results)
+            }
+        } catch (error: Exception) {
+            synchronized(lock) {
+                if (generation == configGeneration) {
+                    _status.value = RelayStatus(RelayConnectionState.OFFLINE, lastCheckedAt = now,
+                        lastOnlineAt = _status.value.lastOnlineAt, lastError = error.message.orEmpty())
+                    _monitorConfigStatus.value = RemoteMonitorConfigStatus(false, _monitorConfigStatus.value.lastLoadedAt, error.message.orEmpty())
+                }
+            }
+            throw error
         }
-        return result
     }
 
     private suspend fun <T> operation(block: suspend () -> T): Result<T> = withContext(Dispatchers.IO) {

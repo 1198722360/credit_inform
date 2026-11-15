@@ -62,10 +62,21 @@ class LocalMonitorStateTest {
         assertEquals(config.id, restored.id)
     }
 
-    @Test fun `fresh install needs no server credentials`() {
+    @Test fun `unlimited response clears a previously numeric balance`() {
+        val previous = LocalMonitorState(value = 4.0, raw = 4.0, breached = true)
+        val result = Result.success(com.creditinform.app.data.RemoteMonitorTestResult(1000, 200, null, null, false))
+        val (next, alarm) = previous.checked(com.creditinform.app.network.testMonitor(), result, 1000, true)
+        assertNull(next.value)
+        assertNull(next.raw)
+        assertFalse(next.breached)
+        assertNull(alarm)
+    }
+
+    @Test fun `fresh install waits for server credentials`() {
         val config = RelayConfig.freshInstall()
         assertFalse(config.enabled)
-        assertTrue(config.isComplete)
+        assertFalse(config.isComplete)
+        assertTrue(config.copy(serverUrl = "https://balance.example", apiToken = "read-token").isComplete)
         assertEquals(1, config.copy(alarmVolumePercent = -1).normalized().alarmVolumePercent)
     }
 }
