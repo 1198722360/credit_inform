@@ -101,7 +101,7 @@ class RelayService : Service() {
         while (currentCoroutineContext().isActive) {
             scheduleRestart(this@RelayService)
             repository.checkDueMonitors().onSuccess {
-                if (storageAlarmRaised) {
+                if (storageAlarmRaised && repository.status.value.state == RelayConnectionState.ONLINE) {
                     storageAlarmRaised = false
                     AlarmController.dismiss(this, AlarmController.RELAY_CONFIG_ALERT_ID)
                 }
@@ -109,7 +109,7 @@ class RelayService : Service() {
                 if (repository.config.value.enabled) {
                     val id = AlarmController.RELAY_CONFIG_ALERT_ID
                     if (!storageAlarmRaised) AlarmController.triggerUrgent(this,
-                        UrgentAlarm(id, "本机监控异常", "无法执行或保存本机检测", error.message.orEmpty(),
+                        UrgentAlarm(id, "余额监控连接异常", "无法从 sub2api 拉取余额", error.message.orEmpty(),
                             soundEnabled = config.soundEnabled, vibrateEnabled = config.vibrateEnabled,
                             alarmVolumePercent = config.alarmVolumePercent, ringtoneUri = config.ringtoneUri))
                     storageAlarmRaised = true
@@ -170,9 +170,9 @@ class RelayService : Service() {
         val monitorCount = repository.monitorStatuses.value.count { it.enabled }
         val detail = when (status.state) {
             RelayConnectionState.ONLINE ->
-                "本机正在监控 $monitorCount 个业务接口"
-            RelayConnectionState.CHECKING -> "正在启动本机监控"
-            RelayConnectionState.OFFLINE -> status.lastError.ifBlank { "本机监控异常" }
+                "正在监控 $monitorCount 个服务端余额"
+            RelayConnectionState.CHECKING -> "正在连接 sub2api"
+            RelayConnectionState.OFFLINE -> status.lastError.ifBlank { "余额服务连接异常" }
             RelayConnectionState.DISABLED -> "本机监控未启用"
         }
         val openApp = PendingIntent.getActivity(

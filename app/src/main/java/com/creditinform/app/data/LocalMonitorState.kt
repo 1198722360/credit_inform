@@ -29,7 +29,7 @@ internal data class LocalMonitorState(
             (config.repeatAlertSeconds > 0 && now - lastAlertAt >= config.repeatAlertSeconds * 1000))
         val next = copy(checkedAt = now, successAt = if (success != null) now else successAt,
             httpCode = success?.httpCode ?: (result.exceptionOrNull() as? RelayApiException)?.httpCode?.takeIf { it > 0 },
-            raw = success?.rawValue ?: raw, value = success?.value ?: value,
+            raw = if (success != null) success.rawValue else raw, value = if (success != null) success.value else value,
             error = if (success != null) "" else result.exceptionOrNull()?.message.orEmpty(),
             breached = success?.breached ?: breached, errors = count,
             nextAt = now + config.pollIntervalSeconds * 1000,

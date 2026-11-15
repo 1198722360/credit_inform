@@ -5,11 +5,14 @@ data class RelayConfig(
     val vibrateEnabled: Boolean = true,
     val soundEnabled: Boolean = true,
     val alarmVolumePercent: Int = 100,
-    val ringtoneUri: String = ""
+    val ringtoneUri: String = "",
+    val serverUrl: String = "",
+    val apiToken: String = ""
 ) {
-    val isComplete: Boolean get() = true
-    val hasAdminAccess: Boolean get() = true
-    fun normalized(): RelayConfig = copy(alarmVolumePercent = alarmVolumePercent.coerceIn(1, 100))
+    val isComplete: Boolean get() = serverUrl.isNotBlank() && apiToken.isNotBlank()
+    val hasAdminAccess: Boolean get() = false
+    fun normalized(): RelayConfig = copy(alarmVolumePercent = alarmVolumePercent.coerceIn(1, 100),
+        serverUrl = serverUrl.trim().trimEnd('/'), apiToken = apiToken.trim())
 
     companion object {
         const val MAX_NAME_LENGTH = 128
